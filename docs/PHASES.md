@@ -68,26 +68,39 @@ This file documents what was built in each phase, what was verified, and any dev
 
 ---
 
-## Phase 2 — Agent Prototype 🔲
+## Phase 2 — Agent Prototype ✅
 **Goal**: LangChain agent skeleton with tool definitions, system prompt v1, and a manual HTTP trigger. Verify the agent reasons correctly and calls tools.
 
-### Planned Deliverables
+### Files Created / Modified
 
-- `agent/orchestrator.py` — full `build_agent()` + `invoke_agent()` with LangChain `create_react_agent`
-- `agent/tools.py` — all `@tool` definitions pre-bound to `user_id`
-- `agent/prompts/orchestrator_system.py` — Orchestrator system prompt
-- `routes/internal.py` — add `POST /internal/trigger` for manual agent invocation
-- Verify: agent calls `get_notes()` and `get_workout_history()` on invocation
-- Verify: agent calls `send_kakao_message()` and message appears in KakaoTalk
+| File | Change |
+|---|---|
+| `agent/prompts/orchestrator_system.py` | Orchestrator system prompt with ReAct format instructions |
+| `agent/tools.py` | All 10 `@tool` definitions via `get_all_tools(user_id, session)` factory |
+| `agent/orchestrator.py` | Full `build_agent()` + `invoke_agent()` with `create_react_agent` |
+| `routes/internal.py` | Added `POST /internal/trigger` (HMAC-gated, `TriggerRequest` body) |
+
+### Key Design Decisions
+
+- Tools are created inside a factory `get_all_tools(user_id, session)` that closes over both `user_id` and the DB `AsyncSession` — no global session state.
+- `build_agent()` instantiates a new `ChatAnthropic` + `AgentExecutor` per invocation so each request gets a clean context. Memory (Phase 4) will be added later.
+- `POST /internal/trigger` uses a separate HMAC message (`b"trigger"`) from the scheduler-tick endpoint so tokens are not interchangeable.
+- `get_location_status` returns `"unknown"` in Phase 2; real data arrives via the geofence webhook wired in Phase 3.
+
+### Deviations from Original Plan
+
+- Switched from `create_react_agent` to `create_tool_calling_agent` — the ReAct text parser breaks on single-parameter non-string tools (passes JSON string directly to `int` field). Claude has native tool use; `create_tool_calling_agent` is the correct choice.
+- Each tool creates its own `AsyncSession` via `AsyncSessionLocal()` instead of sharing the request session — required because the agent calls multiple tools in parallel via `asyncio.gather`, and a single `AsyncSession` cannot handle concurrent queries.
+- `ConversationSummaryBufferMemory` deferred to Phase 4 as planned; Phase 2 passes context entirely via the `{input}` string.
 
 ### Verification Checklist
 
-- [ ] `POST /internal/trigger` with a valid `user_id` invokes the agent
-- [ ] Agent logs show ReAct reasoning steps (tool calls visible in `--verbose`)
-- [ ] Agent calls at least `get_notes` and `get_workout_history` before deciding
-- [ ] A KakaoTalk message is received on the test account
-- [ ] `daily_message_counts` row incremented after message sent
-- [ ] Message guard blocks a 6th message if daily cap is reached
+- [x] `POST /internal/trigger` with a valid `user_id` invokes the agent
+- [x] Agent logs show tool calls visible in `--verbose` (native tool calling, not ReAct text)
+- [x] Agent calls at least `get_notes` and `get_workout_history` before deciding
+- [x] A KakaoTalk message is received on the test account
+- [x] `daily_message_counts` row incremented after message sent
+- [x] Message guard blocks a 6th message if daily cap is reached
 
 ---
 

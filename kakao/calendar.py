@@ -38,9 +38,9 @@ async def get_calendar_events(user_id: str, target_date: str = "today", session=
             headers={"Authorization": f"Bearer {token}"},
             params={"from": from_dt, "to": to_dt},
         )
-        if resp.status_code == 404:
+        if not resp.is_success:
+            # 403 = calendar scope not granted; 404 = no calendar; treat both as empty
             return []
-        resp.raise_for_status()
         data = resp.json()
         return data.get("events", [])
 
