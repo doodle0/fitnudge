@@ -1,0 +1,18 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+
+# uv
+.python-version
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
