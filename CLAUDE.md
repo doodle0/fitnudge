@@ -896,8 +896,10 @@ All other state is in PostgreSQL (durable, queryable).
 
 ## Implementation Priority
 
-1. **Phase 1**: Kakao OAuth + send-to-me message + webhook receiver + DB schema — verify end-to-end message round-trip
-2. **Phase 2**: LangChain agent skeleton with tools, system prompt, manual trigger via HTTP — verify agent reasons correctly and uses tools
-3. **Phase 3**: APScheduler integration, commute detection (time-based first), follow-up scheduling, note save/read loop
-4. **Phase 4**: Sub-agents (WorkoutHistoryAnalyzer, MessageCrafter), ConversationSummaryBufferMemory, full prompt set
-5. **Phase 5**: Beta, prompt tuning, edge cases (injury detection, long absence re-entry, weekly summary)
+See [`docs/PHASES.md`](docs/PHASES.md) for the full phase development log — what was built, what was verified, and deviations from the original plan. **Check the verification checklist in that file before committing each phase.**
+
+1. **Phase 1** ✅ — Kakao OAuth + send-to-me message + webhook receiver + DB schema
+2. **Phase 2** 🔲 — LangChain agent skeleton with tools, system prompt, manual trigger via HTTP
+3. **Phase 3** 🔲 — APScheduler integration, commute detection, follow-up scheduling, note save/read loop
+4. **Phase 4** 🔲 — Sub-agents (WorkoutHistoryAnalyzer, MessageCrafter), ConversationSummaryBufferMemory, full prompt set
+5. **Phase 5** 🔲 — Beta, prompt tuning, edge cases (injury detection, long absence re-entry, weekly summary)
