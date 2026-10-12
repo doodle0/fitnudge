@@ -1,905 +1,479 @@
-# CLAUDE.md — FitNudge Technical Implementation Guide
+# CLAUDE.md — FitNudge Developer Guide
 
-> This file is the technical specification for a coding agent implementing FitNudge. All user-facing strings, KakaoTalk messages, and in-app content are in **Korean**. All code, variable names, comments, and this document are in **English**.
+> **Audience:** developers and coding agents working on this repo. The external, user-facing overview is [`README.md`](README.md).
+>
+> **Language policy**
+> - Everything the *end user* sees (bot messages, persona text, onboarding, error replies) is **Korean**.
+> - Code, identifiers, comments, commit messages, docs, and all developer ↔ coding-agent conversation are **English**.
+> - Prompts sent to Claude are written in **English** with Korean examples and Korean style rules. The model *outputs* Korean.
 
 ---
 
-## Project Overview
+## 1. What FitNudge Is
 
-FitNudge is an LLM-powered KakaoTalk fitness accountability bot. A LangChain agent is woken by a scheduler or incoming user message, gathers context via tools, decides whether and how to engage the user, sends psychologically-crafted Korean messages, and records outcomes. The system is conversational and memory-driven — it replaces rule-based message templates entirely with an LLM that reads history and writes naturally.
+FitNudge is a chat-based fitness companion powered by Claude. It is being built and drilled end to end on **Discord** (DMs); **KakaoTalk Channels** is the planned production frontend once its prerequisites are met (§10). It messages the user at good moments, talks with them like a friend who knows a lot about training, remembers their workout history and what they've said, and **nudges** them toward working out without forcing them.
+
+### Product pillars (every design decision must serve one of these)
+
+| # | Pillar | Where it lives |
+|---|---|---|
+| P1 | **Claude-native agent**: Claude Agent SDK for the conversational orchestrator, plain Claude API for single-shot tasks | `agent/` (§4) |
+| P2 | **Nudge, never force.** The user always has an easy, guilt-free way out | Hard rules (§9), persona prompts (§8) |
+| P3 | **Real behavioral-science techniques**, used in the user's interest | Nudge playbook (§6) |
+| P4 | **Chat frontend behind a channel abstraction**: **Discord now** (end-to-end drill), **KakaoTalk Channels later** (future expansion) | `channels/` (§10) |
+| P5 | **Memory as time-keyed plaintext**: append-only `(timestamp → text)` records per user | `memory/` (§5) |
+| P6 | **Professional, evidence-based training guidance**, including proactive "train this muscle group today" suggestions | `training/` + `knowledge/` (§7) |
+| P7 | **Proactive outreach at the best time** for each user | `scheduler/` + `timing/` (§6.3) |
+| P8 | **Answers workout questions** using the same evidence base | `knowledge/` (§7.3) |
+| P9 | **Preset personas** tuned by a few **personality variables** | `personas/` (§8) |
+| P10 | **Korean service, English engineering** | Language policy above |
 
 ---
 
-## Tech Stack
+## 2. Working Conventions
 
-| Layer | Technology |
+- **Python 3.13+, managed with `uv`.** Use `uv add`, `uv run`, `uvx`. Never use bare `pip`/`python`/`venv`. Commit `uv.lock`.
+- Run locally: `uv run alembic upgrade head`, then `uv run uvicorn main:app --host 0.0.0.0 --reload` (`--host 0.0.0.0` is required under WSL). The Discord bot starts with the app when `DISCORD_BOT_TOKEN` is set.
+- Schema changes go through Alembic (`uv run alembic revision --autogenerate -m "…"`). Regenerate `db/schema.sql` from the models for reference.
+- Tests: `TEST_DATABASE_URL=postgresql+asyncpg://…/fitnudge_test uv run pytest`. The schema of that database is dropped. Without it, DB tests skip. `tests/test_e2e_agent.py` drives the real Agent SDK CLI against `tests/fake_anthropic.py` (offline, free). Proactive tests must not depend on the wall clock (use the `no_quiet_hours` fixture).
+- **Phase log:** [`docs/PHASES.md`](docs/PHASES.md) records what each phase built, how it was verified, and where it deviated from plan. **Every item in a phase's verification checklist must be checked before that phase is committed.** Record each deviation there when it happens.
+- All DB access goes through `db/queries.py`. All outbound user messages go through `channels/` (never call Discord/Kakao directly from agent code). Nothing outside `channels/` may assume a specific platform — the Kakao expansion must be a new adapter, not a refactor.
+- Each tool opens its own `AsyncSession` because the model may call tools in parallel (see the Phase 2 deviation in PHASES.md).
+- Never log access tokens, coordinates, or message content in production (`LOG_CONTENT=false`).
+
+---
+
+## 3. Architecture
+
+```
+                 ┌──────────────── triggers ────────────────┐
+Discord gateway ─┤  inbound DM / slash command (reactive)   │
+  APScheduler   ─┤  timing window / follow-up / weekly recap│
+ (future) Kakao ─┤  skill webhook, geofence, calendar       │
+                 └───────────────────┬──────────────────────┘
+                                     ▼
+                         agent.runtime.invoke(user, trigger)
+                                     │
+             ┌───────────────────────┼─────────────────────────────┐
+             ▼                       ▼                             ▼
+     context builder        Claude Agent SDK              code-enforced guards
+     (DB → prompt:          orchestrator session          (PreToolUse hooks +
+      profile, persona,     ├─ in-process MCP tools        message_guard)
+      memory window,        │   (memory, training,
+      recovery table,       │    knowledge, scheduling,
+      recent turns)         │    send_message)
+                            └─ subagents (recap writer, ...)
+                                     │
+                                     ▼
+                       channels.send(user, text) → Discord (now) | Kakao (future)
+```
+
+- The agent is **not long-running**. Each trigger starts a fresh SDK session, gives it a context snapshot built from Postgres, lets it act, and tears it down. Postgres is the only source of truth. **SDK session resume is not used**, because SDK sessions are local files and don't survive container restarts or horizontal scaling.
+- **Reactive** triggers (the user wrote to us) always get a reply. **Proactive** triggers (we decide to reach out) go through every guard in §9.
+
+---
+
+## 4. Agent Runtime (Claude Agent SDK + Claude API)
+
+### 4.1 Which surface for what
+
+| Job | Surface | Why |
+|---|---|---|
+| Orchestrator: read context, decide, converse, call tools, send | **Claude Agent SDK** (`claude-agent-sdk`) with an in-process MCP server of our tools | Gives us the agent loop, hooks, and subagents without writing our own harness |
+| Memory extraction from a user message → list of memory entries | **Claude API** (`anthropic`), structured output | One call with a fixed schema. No agent loop needed |
+| Workout parsing ("등이랑 이두 했어" → `["back","biceps"]`) | **Claude API**, structured output | Same as above |
+| Weekly recap draft | Agent SDK **subagent** (`recap_writer`) or a single API call | Either works. Start with the API call |
+| Training Q&A | Orchestrator + `lookup_training_knowledge` tool | Answers must be grounded in the curated knowledge base |
+
+### 4.2 Models
+
+- Configured through env: `AGENT_MODEL` (orchestrator) and `UTILITY_MODEL` (extraction/parsing). Both default to `claude-opus-5-5`.
+- Choosing a cheaper model for `UTILITY_MODEL` (e.g. `claude-haiku-5-5`) is a cost decision for the project owner. Make it only after evals show quality holds.
+- Model IDs are exact strings with no date suffix. Current models don't accept `temperature` or `budget_tokens`; control them with `effort` instead.
+
+### 4.3 Orchestrator shape (reference sketch, not final code)
+
+```python
+# agent/runtime.py
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher, create_sdk_mcp_server
+
+async def invoke(user_id: str, trigger: Trigger) -> None:
+    ctx = await build_context(user_id, trigger)          # §4.5
+    server = create_sdk_mcp_server(name="fitnudge", version="1.0.0",
+                                   tools=build_tools(user_id, trigger))   # §4.4
+    options = ClaudeAgentOptions(
+        model=settings.agent_model,
+        system_prompt=render_system_prompt(ctx.persona),  # stable → cacheable
+        mcp_servers={"fitnudge": server},
+        allowed_tools=[f"mcp__fitnudge__{t}" for t in TOOL_NAMES],
+        # No built-in Claude Code tools (Bash/Read/Write/Web*). This is a chat bot, not a coding agent.
+        hooks={"PreToolUse": [HookMatcher(matcher="mcp__fitnudge__send_message",
+                                          hooks=[guard_send_message])]},
+        max_turns=12,
+    )
+    async with ClaudeSDKClient(options=options) as client:
+        await client.query(ctx.render_user_turn())        # trigger + volatile context
+        async for _ in client.receive_response():
+            pass                                          # log tool calls / usage
+```
+
+Rules:
+- Before writing the migration, check exact SDK names and option fields against the current docs (`code.claude.com/docs/en/agent-sdk`). Pin the SDK version in `pyproject.toml`.
+- Explicitly disable the SDK's built-in tools (file system, shell, web) and don't load filesystem settings (`setting_sources`). The bot must not be able to touch the container.
+- `send_message` is guarded twice: once by the PreToolUse hook (it can deny with a reason the model sees) and again inside the tool (defense in depth).
+- **Prompt caching:** the system prompt (persona + rules + playbook) and the tool list stay byte-stable. Timestamps, the memory window, and the trigger go in the user turn.
+- Wrap each invocation in a timeout and catch all exceptions. A failed run is logged with its trigger and never crashes the scheduler or webhook.
+
+### 4.4 Tool surface (in-process MCP, all bound to one `user_id`)
+
+| Tool | Purpose |
 |---|---|
-| **Backend** | Python 3.13+, FastAPI |
-| **Package Manager** | [uv](https://docs.astral.sh/uv/) — dependencies declared in `pyproject.toml`, locked in `uv.lock` |
-| **LLM Agent** | LangChain `create_react_agent`, `langchain-anthropic` (Claude claude-sonnet-4-5 or later) |
-| **Agent Memory** | `ConversationSummaryBufferMemory` (LangChain) backed by PostgreSQL |
-| **Scheduler** | APScheduler 3.x with `SQLAlchemyJobStore` (persistent across restarts) |
-| **Primary DB** | PostgreSQL 15+ |
-| **Cache / State** | Redis 7+ |
-| **HTTP Client** | `httpx` (async) for all Kakao API calls |
-| **Deployment** | Railway or Render (always-on container); or AWS ECS Fargate |
+| `memory_read(since, until?, kinds?)` | Time-ranged read of memory entries (§5) |
+| `memory_write(text, kind, at?)` | Append a memory entry. `at` defaults to now |
+| `get_workout_log(days)` | Confirmed sessions only |
+| `record_workout(muscle_groups, notes?, performed_at?)` | Record a completed session, update streak, write a memory entry |
+| `get_recovery_status()` | Per-muscle-group days since last trained + readiness (§7.2). Computed in code |
+| `suggest_next_session()` | Deterministic rotation suggestion with a rationale (§7.2) |
+| `lookup_training_knowledge(query)` | Retrieve cited passages from `knowledge/` (§7.3) |
+| `get_calendar_events(date)` | *(future, with Kakao or another calendar)* overtime/dinner suppression. Not registered in the Discord drill |
+| `get_location_status()` | *(future)* `at_work` / `left_work` / `near_gym` / `unknown`. Not registered in the Discord drill |
+| `send_message(text)` | Send through the active channel. Guarded |
+| `schedule_followup(at, reason)` / `cancel_followup()` | One pending follow-up per user |
+| `update_profile(field, value)` | Whitelisted fields only: weekly goal, persona variables, rest days |
+
+The tools return plain text that the model can read easily. Errors come back as tool errors rather than exceptions.
+
+### 4.5 Context snapshot (per invocation)
+
+Built in code, injected as the first user turn:
+- Trigger type and payload, local time (KST), weekday
+- Profile: nickname, weekly goal, rest days, preferred exercises, persona + variables
+- Today: worked out?, proactive messages sent / cap, unanswered count, pending follow-up
+- Streak, this week's count vs goal
+- Recovery table (from `training/`)
+- Memory window: last 14 days of entries plus any older pinned `injury` / `goal` entries
+- Last ~20 conversation turns verbatim
+
+There is no LangChain memory. Long-term continuity comes from memory entries, not from replaying transcripts.
 
 ---
 
-## Environment Variables
+## 5. Memory Model — Time-Keyed Plaintext
+
+Memory is a per-user, **append-only key–value log where the key is a timestamp and the value is a short plaintext statement.** It must be human-readable, easy to diff, and easy to delete.
+
+```
+2026-10-13T18:35+09:00  [commitment]  21시에 헬스장 가기로 함 (등 운동)
+2026-10-13T22:02+09:00  [workout]     등, 이두 완료. 풀업 처음으로 5개 성공했다고 함
+2026-10-10T19:10+09:00  [injury]      오른쪽 무릎 통증 언급 — 하체 고중량 피하기
+2026-10-08T12:00+09:00  [context]     이번 주 수–금 부산 출장
+```
+
+- Table `memory_entries(id, user_id, at TIMESTAMPTZ, kind TEXT, text TEXT, pinned BOOL, superseded_by UUID NULL, created_at)` with an index on `(user_id, at DESC)`. This replaces `agent_notes`. Migrate existing rows with `at = date + 12:00 KST, kind = 'note'`.
+- `kind` ∈ `commitment | workout | injury | skip_reason | mood | goal | preference | context | note`.
+- **Values are plaintext**, in Korean when quoting or paraphrasing the user. There are no JSON blobs in `text`.
+- Corrections never edit an entry. A new entry is written and the old one's `superseded_by` is set.
+- `injury` and `goal` entries are pinned automatically until a later entry resolves them.
+- Writes come from two paths: the orchestrator's `memory_write`, and an automatic extraction pass (Claude API, structured output) on every inbound user message. Both are idempotent per message.
+- `workout_sessions` stays as the **structured** source of truth for confirmed workouts (streaks and recovery need typed data). Memory is the narrative layer on top of it.
+- Users can say "내 기록 보여줘" / "다 지워줘". The export and delete paths (§11) cover this table.
+
+---
+
+## 6. Nudge Playbook (P2, P3)
+
+### 6.1 Techniques
+
+These are real, named behavioral-science mechanisms, used to help the user do something *they* said they want. The orchestrator system prompt describes each one, with the guardrail next to it.
+
+| Technique | Mechanism | How FitNudge applies it | Guardrail |
+|---|---|---|---|
+| **Implementation intentions** (Gollwitzer) | "When X, I will Y" plans raise follow-through | Ask for *when + what*: "몇 시쯤, 뭐 할 거예요?" Save as `commitment` | The user picks the plan. We never assign one |
+| **Commitment & consistency** (Cialdini) | People act in line with their stated commitments | Remind them of *their own* plan in their words | Never shame them for breaking it |
+| **Loss aversion / streaks** (Kahneman & Tversky) | Losses loom larger than gains | "4일째인데 오늘 하면 5일" | Only real streaks. Never use it right after a streak breaks |
+| **Endowed progress** (Nunes & Drèze) | Progress already made motivates completion | "이번 주 목표 3회 중 2회 끝" | Real counts only |
+| **Goal gradient** | Effort rises near the goal | Lean in when one session from the weekly goal | — |
+| **Fresh start effect** (Dai, Milkman, Riis) | Temporal landmarks prompt new starts | Re-engage on Mondays, the 1st of the month, after holidays, after long gaps | Lowered bar after an absence |
+| **Foot-in-the-door / reduced ask** | A small yes leads to a bigger yes | "10분만", "스트레칭이라도" | The small ask is a real option, not a trick |
+| **Specificity / choice architecture** | A concrete default lowers decision cost | Suggest a specific muscle group from the recovery data | Easy to swap ("하체 말고 다른 거?") |
+| **Temptation bundling** (Milkman) | Pair a want with a should | Tie the workout to something they mentioned enjoying (a podcast, a post-gym meal) | Only from their own stated preferences |
+| **Specific praise / reinforcement** | Specific feedback reinforces the behavior | Name what they did: "풀업 5개 처음이잖아요" | Only facts from the data |
+| **Autonomy support** (Self-Determination Theory) | Felt choice sustains motivation | Every nudge includes an easy out | Mandatory (§9) |
+
+**Forbidden, regardless of persona:** invented social proof ("다른 사람들은 다 했어요"), fake scarcity or urgency, guilt, shame, comments about appearance or weight, fear appeals about health, lying about data, and pressure after a stated injury, illness, or emotional distress.
+
+### 6.2 Escalation ladder (proactive, per day)
+
+1. Initial nudge: a specific suggestion plus an easy out
+2. No reply after ~30–45 min: a different angle (progress or streak)
+3. Still no reply: the reduced ask
+4. Soft release ("오늘은 쉬어도 돼요, 내일 봐요"), then **silence for the rest of the day**
+
+Any reply resets the ladder. A stated skip or rest ends it immediately with zero-judgment acknowledgment.
+
+### 6.3 Timing (P7)
+
+`timing/` computes a per-user **send window** each day. The agent chooses *whether* to message. Code decides *when it's allowed*.
+
+Signals, in priority order:
+1. An explicit commitment ("21시에 갈게"): pre-reminder about 30 min before, check-in about 15 min after
+2. Learned habits: the median hour of past reported workouts and of past reply latency, per weekday, updated nightly
+3. Configured `default_departure_time`
+4. Declared rest days and stated obstacles from memory (회식, 야근, 출장)
+5. *(future, Kakao expansion)* geofence exit from the workplace and calendar suppression
+
+The cron tick (every 5 min) only asks `timing.is_window_open(user)`. Follow-ups are one-shot APScheduler jobs stored in `SQLAlchemyJobStore`.
+
+---
+
+## 7. Training Expertise (P6, P8)
+
+### 7.1 Principle
+
+**The LLM explains. Code and curated sources decide the facts.** Recovery math, rotation, and volume counting are deterministic. Factual claims come from `knowledge/` with citations. The model never invents numbers.
+
+### 7.2 Recommendation engine (`training/`)
+
+- Canonical muscle-group taxonomy with Korean aliases (`등/광배 → back`, `하체/스쿼트 → legs` …) in `training/taxonomy.py`. The workout parser maps free text onto it.
+- `recovery.py`: days since each group was last trained, a readiness flag (default ≥48 h for most groups, ≥72 h after heavy lower-body work, per the knowledge base), and weekly frequency per group.
+- `rotation.py`: suggests the next session from readiness, the user's split habits (e.g. always 등+이두), preferences, and pinned injuries (excluded groups). It returns a suggestion **and the reason** so the message can cite it ("가슴은 이틀 쉬었고 등은 4일째라 오늘은 등 어때요?").
+- Unit-tested with fixed histories. This is the one module that must have tests.
+
+### 7.3 Knowledge base (`knowledge/`)
+
+- Markdown files, one topic each (recovery, weekly volume, progressive overload, warm-up, beginner splits, cardio guidelines, sleep and recovery, common injuries → when to see a professional). Each claim carries a source (e.g. ACSM position stands, WHO physical activity guidelines, peer-reviewed meta-analyses) and a `last_reviewed` date.
+- `lookup_training_knowledge` does a simple retrieval over these files (keyword/BM25 first, embeddings only if needed).
+- Q&A rules: answer from retrieved passages. Say plainly when the knowledge base doesn't cover a question. **No medical diagnosis.** For pain, injury, or medical conditions, suggest seeing a professional (의사/물리치료사) and pin an `injury` memory.
+- Content is reviewed by a human before it's merged. The knowledge base is product content, not generated output.
+
+---
+
+## 8. Personas (P9)
+
+A persona is a **preset** (identity + voice) plus a small set of **personality variables** that tune it. Both render into the stable part of the system prompt.
+
+The bot's display name is **운완이** (`BOT_NAME`). Persona presets change its voice, not its name.
+
+### 8.1 Presets (initial set, names TBD)
+
+| id | Concept | Default voice |
+|---|---|---|
+| `buddy` | Gym friend who remembers everything | 반말, playful, emoji-friendly |
+| `coach` | Calm, knowledgeable PT | 존댓말, concise, explains the "why" |
+| `cheerleader` | All-in hype | 반말/해요체, high energy |
+| `tsundere` | Teasing but caring | 반말, dry humor, never mean |
+
+### 8.2 Personality variables (bounded, per user)
+
+| Variable | Range | Effect |
+|---|---|---|
+| `formality` | `banmal` / `haeyo` / `hapsyo` | Speech level |
+| `warmth` | 1–5 | Emotional expressiveness |
+| `push` | 1–5 | How assertive nudges are. **Caps at the autonomy rule**: even 5 includes an out |
+| `humor` | 0–3 | Jokes and teasing |
+| `emoji` | 0–3 | Emoji density |
+| `verbosity` | 1–3 | 1–2 sentences up to 3–4 sentences |
+
+- Stored in `user_persona(user_id, preset_id, variables JSONB)`. Users change these in conversation ("좀 더 세게 말해줘" → `push+1`) through `update_profile`.
+- Defined in `personas/presets.py` as data. Rendering is `personas/render.py`, which turns preset + variables into a deterministic prompt block (stable bytes for caching).
+- **Hard rules (§9) and forbidden techniques (§6.1) are outside the persona block and override it.**
+
+---
+
+## 9. Hard Rules — Enforced in Code
+
+The prompt also states these, but code is the guarantee.
+
+| Rule | Enforcement point |
+|---|---|
+| Max `MAX_DAILY_PROACTIVE` (default 4) proactive messages per user per day | `send_message` hook + tool, `daily_message_counts` |
+| No proactive messages between `QUIET_START` and `QUIET_END` (default 22:00–08:00 local) | `timing` + hook |
+| After 3 unanswered proactive messages, stop proactive messages for the day | hook (counts from `conversation_turns`) |
+| No nudge once today's workout is recorded, on a declared rest day, or during an active illness/trip window | `timing.is_window_open` |
+| Proactive messages only to users who opted in during onboarding and haven't paused (`/pause`) | `timing.is_window_open` |
+| Reactive replies are always allowed, but rate-limited (`MAX_DAILY_REPLIES`, default 50) for abuse protection | hook |
+| Persona can't override the autonomy rule or forbidden techniques | Prompt structure + eval suite |
+| Never reference a workout not in `workout_sessions` | Prompt + eval suite |
+
+Note: the current `utils/message_guard.can_send` blocks the *whole invocation*, including replies to the user. Phase 3 splits it into proactive and reactive guards.
+
+---
+
+## 10. Messaging Channels (P4)
+
+### 10.1 Abstraction
+
+```python
+# channels/base.py
+class Channel(Protocol):
+    name: str                                    # "discord" | "kakao"
+    async def send(self, identity: ChannelIdentity, text: str) -> None: ...
+    async def start(self) -> None: ...           # gateway connect / no-op for webhooks
+```
+
+- Inbound messages are normalized to `InboundMessage(channel, external_user_id, text, received_at)` and handed to `agent.runtime.invoke` with a reactive trigger.
+- Users are platform-neutral. Platform IDs live in `channel_identities(user_id, channel, external_id, opted_in_proactive, created_at)` with `UNIQUE(channel, external_id)`. A user has one *active* channel (`users.active_channel`).
+- Agent code only knows `send_message`. It never sees a Discord or Kakao ID.
+
+### 10.2 Discord (current target: end-to-end drill)
+
+Discord lets a bot DM users first with no business verification and no per-message cost, so the whole loop can be built and tested there: proactive nudge → reply → follow-up → recorded workout.
+
+- **Library:** `discord.py` (pin the version). The client runs **inside the FastAPI process** and is started and stopped in the app lifespan alongside APScheduler, on the same event loop. Run one instance only (the gateway connection is a singleton; no sharding needed at our scale).
+- **Conversation surface:** 1:1 **DMs** with the bot. DM message content reaches the bot without the privileged Message Content intent. Don't enable that intent, and ignore guild channel messages.
+- **Reaching users first:** a bot can open a DM only with users it shares a server with. Users join a small FitNudge server (invite link), then run `/start` there or in DM. If a user closes DMs or leaves, the send fails (`Forbidden`): mark `opted_in_proactive = false` and stop proactive sends.
+- **Slash commands** (Korean names and descriptions): `/start` (onboarding, consent to proactive DMs, disclaimer), `/pause` and `/resume` (proactive DMs), `/persona`, `/기록` (export), `/삭제` (delete everything). Free text in DM is always the main interface. Commands are shortcuts.
+- **Reply latency:** none of Kakao's 5-second limits apply. Show a typing indicator (`async with dm.typing()`) while the agent runs.
+- **Formatting:** plain text only. No embeds for conversational turns, to keep parity with a future Kakao text bubble. Messages over 2000 characters must never happen (the style rules keep them at 1–4 sentences); truncate defensively.
+- **Retired from the Phase 1 code:** Kakao Login OAuth as the identity source, send-to-me messaging, `/webhook/message` and `/webhook/location`. Keep `kakao/` code in the tree, but leave it unwired, for the expansion.
+
+### 10.3 KakaoTalk Channels (future expansion)
+
+Kakao Channels + Kakao i Open Builder is the intended production frontend for Korean users. It's deferred because **proactive messaging requires business verification**. Researched facts (2026-10):
+
+| Need | Kakao mechanism | Prerequisites / limits |
+|---|---|---|
+| Reply to a user | Open Builder **skill** on the fallback block → our webhook | Any channel. 5 s skill timeout |
+| Slow (LLM) replies | Skill **callback**: respond `{"version":"2.0","useCallback":true}`, then POST the reply to the one-time `callbackUrl` | Turned on per block. Docs cite a 1–5 min validity window (inconsistent). Bot test doesn't fully support it |
+| Message a user first | **Event API** `POST https://bot-api.kakao.com/v2/bots/{botId}/talk`, user by `botUserKey` / `plusfriendUserKey` / `appUserId` | **Business-verified channel + business-verified Developers app, connected; Kakao Login enabled; event name on a block; wallet.** 15 KRW/message (VAT excl.). Recipient must have added the channel. Max 100 users/request |
+| Ad classification | Recurring same-topic messages are treated as **ads** | Ads: 08:00–20:50 only, "(광고)" prefix, opt-out, single card bubble, channel friends only. **Must confirm with Kakao how personalized, user-subscribed nudges are classified** |
+
+Prerequisites to start the expansion:
+1. 사업자등록 (개인사업자 is enough) → channel business verification → Developers app converted to a 비즈 앱 and connected to the channel
+2. Written confirmation from 챗봇 관리자센터 support on the ad classification of nudges. If they count as ads, the 20:50 cutoff and "(광고)" prefix conflict with §6, so the product would need a redesign before launching on Kakao
+3. Wallet + per-message budget
+
+Implementation then is a `channels/kakao.py` adapter: the skill webhook with callback for replies, the Event API for proactive messages, and `botUserKey` as the `external_id`. Optional add-ons that only make sense on Kakao: Kakao Calendar (회식/야근 suppression) and a geofence signal from a companion client.
+
+Sources: [Event API](https://kakaobusiness.gitbook.io/main/tool/chatbot/main_notions/event-api), [AI chatbot callback guide](https://kakaobusiness.gitbook.io/main/tool/chatbot/skill_guide/ai_chatbot_callback_guide), [Event API pricing](https://cs.kakao.com/helps_html/1073196772?locale=ko).
+
+---
+
+## 11. Data, Security, Privacy
+
+- **Tables:** `users` (platform-neutral; Kakao OAuth columns become nullable and move to the Kakao expansion), `channel_identities`, `user_persona`, `workout_sessions`, `memory_entries` (replaces `agent_notes`), `conversation_turns`, `streaks`, `daily_message_counts` (split into proactive/reactive columns), `scheduled_followups`, `timing_profile`. `db/schema.sql` mirrors the ORM. Use Alembic migrations from Phase 3 onward. Stop relying on `create_tables()` in production.
+- `DISCORD_BOT_TOKEN` is a secret: never log it, and rotate it if leaked. Inbound Discord events are authenticated by the gateway connection itself.
+- (Kakao expansion) Encrypt OAuth tokens at rest (application-level AES-GCM or pgcrypto). Verify skill webhook requests (bot ID / shared header).
+- `/internal/*` stays HMAC-gated.
+- PIPA/GDPR: `DELETE /user/me` and the "다 지워줘" intent hard-delete all user rows across tables. "내 기록 보여줘" exports memory and workouts as plaintext.
+- Health-data sensitivity: injuries and moods are personal data. Minimize what's stored, never log it, and state in onboarding that FitNudge is not medical advice.
+
+---
+
+## 12. Target Project Structure
+
+```
+fitnudge/
+├── main.py
+├── config.py
+├── agent/
+│   ├── runtime.py            # Agent SDK orchestrator + PreToolUse guard hook
+│   ├── tools.py              # in-process MCP tools (@tool)
+│   ├── dispatch.py           # inbound handling, per-user run serialization/coalescing
+│   ├── triggers.py           # Trigger (reactive vs proactive)
+│   ├── context.py            # context snapshot builder
+│   ├── extract.py            # Claude API: memory extraction, workout parsing
+│   ├── subagents.py          # AgentDefinition(s), e.g. recap_writer
+│   └── prompts/              # system prompt sections (English, Korean examples)
+├── personas/                 # presets.py, render.py
+├── memory/                   # store.py (time-keyed plaintext log)
+├── training/                 # taxonomy.py, recovery.py, rotation.py (+ tests)
+├── knowledge/                # curated, cited markdown + retrieval.py
+├── timing/                   # send windows, habit learning
+├── channels/                 # base.py, discord.py (now), kakao.py (future)
+├── discord_bot/              # bot.py: discord.py client, slash commands (started in main.py lifespan)
+├── kakao/                    # low-level Kakao REST clients — kept, unwired until the expansion
+├── scheduler/                # APScheduler setup + jobs
+├── routes/                   # internal (HMAC trigger), health; Kakao routes unwired
+├── db/                       # models.py, queries.py, schema.sql, migrations/
+├── utils/
+├── tests/                    # unit, DB, and offline e2e (fake Messages API) tests
+├── evals/                    # scenario transcripts + graders (§13)
+└── docs/PHASES.md
+```
+
+---
+
+## 13. Quality & Evals
+
+- **Scenario evals** in `evals/`: scripted multi-turn situations (commit → remind → complete, skip for 회식, injury mention, 7-day absence, persona switch, an off-topic question, a medical question). Each has assertions:
+  - Code checks: tool calls made, guard respected, no message in quiet hours
+  - LLM-graded checks: Korean naturalness, persona adherence, autonomy present, no forbidden technique, no fabricated history
+- Run evals before changing prompts or models. Record results in PHASES.md.
+- Unit tests: `training/`, `timing/`, `memory/`, guards. Run with `uv run pytest`.
+
+---
+
+## 14. Environment Variables
 
 ```env
-# Anthropic
+# Claude
 ANTHROPIC_API_KEY=
+AGENT_MODEL=claude-opus-5-5
+UTILITY_MODEL=claude-opus-5-5
 
-# Kakao
+# Channels
+PRIMARY_CHANNEL=discord          # discord | kakao (future)
+DISCORD_BOT_TOKEN=
+DISCORD_GUILD_ID=                # FitNudge server; slash commands sync here during dev
+
+# Kakao (future expansion — unused in the Discord drill)
 KAKAO_REST_API_KEY=
 KAKAO_CLIENT_SECRET=
 KAKAO_REDIRECT_URI=
 KAKAO_ADMIN_KEY=
+KAKAO_BOT_ID=
 
-# Database
+# Storage
 DATABASE_URL=postgresql+asyncpg://user:pass@host/db
 REDIS_URL=redis://localhost:6379/0
 
 # App
 APP_BASE_URL=https://your-app.com
-SECRET_KEY=                        # For signing internal requests
-MAX_DAILY_MESSAGES=5               # Hard cap on agent messages per user per day
-AGENT_SILENT_AFTER_HOUR=22         # Local hour (24h) after which agent never messages
+SECRET_KEY=
+LOG_CONTENT=false
+
+# Guards
+MAX_DAILY_PROACTIVE=4
+MAX_DAILY_REPLIES=50
+QUIET_START=22
+QUIET_END=8
 ```
 
 ---
 
-## Project Structure
+## 15. Migration: LangChain → Claude Agent SDK
 
-```
-fitnudge/
-├── main.py                        # FastAPI app entry point
-├── agent/
-│   ├── orchestrator.py            # Main LangChain agent (create_react_agent)
-│   ├── tools.py                   # All @tool definitions
-│   ├── subagents/
-│   │   ├── history_analyzer.py    # WorkoutHistoryAnalyzer sub-agent
-│   │   ├── message_crafter.py     # MessageCrafter sub-agent
-│   │   └── note_keeper.py         # NoteKeeper sub-agent
-│   └── prompts/
-│       ├── orchestrator_system.py
-│       ├── initial_nudge.py
-│       ├── commitment_confirm.py
-│       ├── pre_commitment_reminder.py
-│       ├── overdue_checkin.py
-│       ├── no_response_renudge.py
-│       ├── completion_celebration.py
-│       ├── skip_acknowledgment.py
-│       ├── history_analysis.py
-│       ├── note_extraction.py
-│       └── weekly_summary.py
-├── scheduler/
-│   ├── jobs.py                    # APScheduler job definitions
-│   └── triggers.py                # Logic for deciding when to invoke agent
-├── kakao/
-│   ├── auth.py                    # OAuth flow, token refresh
-│   ├── message.py                 # send_kakao_message()
-│   ├── location.py                # Location API, geofencing
-│   └── calendar.py                # Calendar read/write
-├── db/
-│   ├── models.py                  # SQLAlchemy ORM models
-│   ├── schema.sql                 # Raw SQL schema for reference
-│   └── queries.py                 # Typed query helpers
-├── routes/
-│   ├── auth.py                    # /auth/kakao, /auth/callback
-│   ├── webhook.py                 # /webhook/message, /webhook/location
-│   └── internal.py                # /internal/scheduler-tick (cron endpoint)
-├── utils/
-│   ├── haversine.py
-│   ├── time_utils.py              # Korean timezone helpers
-│   └── message_guard.py          # Enforces MAX_DAILY_MESSAGES hard cap
-├── .env.example
-├── pyproject.toml                 # uv-managed dependencies
-├── uv.lock                        # locked dependency graph
-└── CLAUDE.md
-```
+1. `uv add claude-agent-sdk anthropic` and pin both. The Agent SDK runs the Claude Code runtime, so confirm the deploy image can run it.
+2. Port the LangChain `@tool`s in `agent/tools.py` to SDK `@tool` functions in one `create_sdk_mcp_server`. Keep the per-tool `AsyncSession` pattern. Leave the calendar and location tools unregistered (§4.4).
+3. Replace `build_agent()`/`AgentExecutor` with `agent/runtime.py` (§4.3). Move the guard into a PreToolUse hook and keep the in-tool check.
+4. Port the system prompt. Drop the ReAct/LangChain formatting and restructure it into: rules → playbook → persona block → style.
+5. Add the Claude API utility calls (`agent/extract.py`) for memory extraction and workout parsing.
+6. Swap `agent_notes` → `memory_entries` (Alembic migration + backfill).
+7. Re-run the Phase 2 verification checklist against the new runtime. Then `uv remove langchain langchain-anthropic langchain-community`.
 
 ---
 
-## Database Schema
+## 16. Roadmap
 
-```sql
--- Users
-CREATE TABLE users (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  kakao_id BIGINT UNIQUE NOT NULL,
-  kakao_nickname TEXT,
-  access_token TEXT NOT NULL,
-  refresh_token TEXT NOT NULL,
-  token_expires_at TIMESTAMPTZ NOT NULL,
-  workplace_lat DOUBLE PRECISION,
-  workplace_lng DOUBLE PRECISION,
-  default_departure_time TIME,
-  weekly_goal_count INT DEFAULT 3,
-  preferred_exercises TEXT[],
-  timezone TEXT DEFAULT 'Asia/Seoul',
-  onboarding_complete BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
+Details and checklists: [`docs/PHASES.md`](docs/PHASES.md).
 
--- Workout sessions
-CREATE TABLE workout_sessions (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  date DATE NOT NULL,
-  muscle_groups TEXT[] NOT NULL,      -- e.g. ARRAY['등', '이두']
-  raw_user_message TEXT,              -- verbatim what the user said
-  agent_notes TEXT,
-  source TEXT CHECK (source IN ('user_report', 'geofence', 'manual')),
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Date-keyed notes (agent's memory of notable events)
-CREATE TABLE agent_notes (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  date DATE NOT NULL DEFAULT CURRENT_DATE,
-  note TEXT NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_agent_notes_user_date ON agent_notes(user_id, date DESC);
-
--- Conversation history (full turn log)
-CREATE TABLE conversation_turns (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  role TEXT CHECK (role IN ('agent', 'user')) NOT NULL,
-  content TEXT NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Streak tracking
-CREATE TABLE streaks (
-  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  current_streak INT DEFAULT 0,
-  longest_streak INT DEFAULT 0,
-  last_workout_date DATE,
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Daily message count guard
-CREATE TABLE daily_message_counts (
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  date DATE NOT NULL DEFAULT CURRENT_DATE,
-  count INT DEFAULT 0,
-  PRIMARY KEY (user_id, date)
-);
-
--- Scheduled follow-ups
-CREATE TABLE scheduled_followups (
-  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  job_id TEXT NOT NULL,              -- APScheduler job ID
-  reason TEXT,
-  scheduled_for TIMESTAMPTZ,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-```
-
----
-
-## LangChain Agent Setup
-
-### Orchestrator Agent
-
-```python
-# agent/orchestrator.py
-from langchain.agents import create_react_agent, AgentExecutor
-from langchain_anthropic import ChatAnthropic
-from langchain.memory import ConversationSummaryBufferMemory
-from langchain_community.chat_message_histories import SQLChatMessageHistory
-from agent.tools import get_all_tools
-from agent.prompts.orchestrator_system import build_orchestrator_prompt
-
-def build_agent(user_id: str) -> AgentExecutor:
-    llm = ChatAnthropic(
-        model="claude-sonnet-4-5",
-        max_tokens=1024,
-        temperature=0.7,
-    )
-
-    # Persistent memory per user backed by PostgreSQL
-    message_history = SQLChatMessageHistory(
-        session_id=user_id,
-        connection_string=settings.DATABASE_URL,
-    )
-    memory = ConversationSummaryBufferMemory(
-        llm=llm,
-        chat_memory=message_history,
-        max_token_limit=2000,
-        memory_key="conversation_history",
-        return_messages=True,
-    )
-
-    tools = get_all_tools(user_id)
-    prompt = build_orchestrator_prompt()
-
-    agent = create_react_agent(llm=llm, tools=tools, prompt=prompt)
-    return AgentExecutor(
-        agent=agent,
-        tools=tools,
-        memory=memory,
-        verbose=True,
-        max_iterations=10,
-        handle_parsing_errors=True,
-    )
-
-
-async def invoke_agent(user_id: str, trigger_reason: str, user_message: str = None):
-    """
-    Main entry point. Called by scheduler or webhook handler.
-    Enforces hard daily message cap before invoking.
-    """
-    if not await message_guard.can_send(user_id):
-        return  # Hard cap reached — do not invoke agent
-
-    user_context = await build_user_context(user_id)
-    
-    input_text = f"Trigger: {trigger_reason}"
-    if user_message:
-        input_text += f"\nUser message: {user_message}"
-    input_text += f"\n\nUser context:\n{user_context}"
-
-    executor = build_agent(user_id)
-    await executor.ainvoke({"input": input_text})
-```
-
-### Tool Definitions
-
-```python
-# agent/tools.py
-from langchain.tools import tool
-from functools import partial
-
-def get_all_tools(user_id: str):
-    """Returns all tools pre-bound to the user_id."""
-
-    @tool
-    async def get_workout_history(days: int = 30) -> str:
-        """Get the user's workout history for the last N days.
-        Returns a list of sessions with dates and muscle groups trained."""
-        sessions = await db.get_workout_sessions(user_id, days=days)
-        return format_workout_history(sessions)
-
-    @tool
-    async def get_notes(days: int = 14) -> str:
-        """Get the agent's saved notes about this user from the last N days.
-        Notes include commitments, injuries, mood, stated plans."""
-        notes = await db.get_notes(user_id, days=days)
-        return "\n".join(f"[{n.date}] {n.note}" for n in notes)
-
-    @tool
-    async def save_note(note: str) -> str:
-        """Save a notable fact about the user with today's date.
-        Use after every meaningful user message to capture: commitments made,
-        injuries mentioned, reasons for skipping, emotional state, goal changes."""
-        await db.insert_note(user_id, note)
-        return "Note saved."
-
-    @tool
-    async def get_location_status() -> str:
-        """Check the user's current location status.
-        Returns one of: 'at_work', 'commuting', 'near_gym', 'at_home', 'unknown'."""
-        return await kakao.get_location_status(user_id)
-
-    @tool
-    async def get_calendar_events(date: str = "today") -> str:
-        """Get the user's Kakao Calendar events for a given date (default: today).
-        Use to detect overtime or dinner events that should suppress nudging."""
-        events = await kakao.get_calendar_events(user_id, date)
-        return format_calendar_events(events)
-
-    @tool
-    async def get_streak() -> str:
-        """Get the user's current and longest workout streak."""
-        streak = await db.get_streak(user_id)
-        return f"Current streak: {streak.current}, Longest: {streak.longest}, Last workout: {streak.last_workout_date}"
-
-    @tool
-    async def send_kakao_message(message_text: str) -> str:
-        """Send a KakaoTalk message to the user.
-        Write in Korean. Keep it to 2-4 sentences. Sound like a friend, not a system."""
-        await kakao.send_message(user_id, message_text)
-        await message_guard.increment(user_id)
-        await db.insert_conversation_turn(user_id, role="agent", content=message_text)
-        return "Message sent."
-
-    @tool
-    async def save_workout_record(muscle_groups: list[str], notes: str = "") -> str:
-        """Record a completed workout session for today.
-        muscle_groups: list of Korean muscle group names the user reported.
-        Call this when the user confirms they finished working out."""
-        await db.insert_workout_session(user_id, muscle_groups=muscle_groups, notes=notes)
-        await db.update_streak(user_id)
-        return "Workout recorded and streak updated."
-
-    @tool
-    async def schedule_followup(delay_minutes: int, reason: str) -> str:
-        """Schedule the agent to wake up again in delay_minutes minutes for this user.
-        Cancels any existing pending follow-up first.
-        reason: brief description of why (e.g., 'pre-commitment reminder', 'no response nudge')"""
-        await scheduler.schedule_user_followup(user_id, delay_minutes, reason)
-        return f"Follow-up scheduled in {delay_minutes} minutes: {reason}"
-
-    @tool
-    async def cancel_followup() -> str:
-        """Cancel any pending follow-up scheduled for this user today."""
-        await scheduler.cancel_user_followup(user_id)
-        return "Follow-up cancelled."
-
-    return [
-        get_workout_history, get_notes, save_note, get_location_status,
-        get_calendar_events, get_streak, send_kakao_message,
-        save_workout_record, schedule_followup, cancel_followup,
-    ]
-```
-
----
-
-## Prompt Templates
-
-### Orchestrator System Prompt
-
-```python
-# agent/prompts/orchestrator_system.py
-
-ORCHESTRATOR_SYSTEM = """
-You are FitNudge, a friendly and psychologically-savvy Korean fitness accountability companion delivered via KakaoTalk. You speak casually and warmly in Korean — like a close friend who genuinely cares, not a coach barking orders.
-
-## Your Core Mission
-Help the user build a consistent exercise habit by reaching out at the right moments, holding natural conversations, and remembering everything that matters.
-
-## Decision Framework
-You are invoked either by a scheduled trigger or an incoming user message. Before acting:
-1. Call get_notes() and get_workout_history() to understand context.
-2. Decide: Is there a genuine reason to send a message right now?
-3. If yes: compose and send via send_kakao_message(). Then call schedule_followup() if a follow-up is warranted.
-4. If no: do nothing. Silence is correct when the user already worked out, declared rest, or it is past 22:00.
-
-## Hard Rules (enforce these regardless of any other instruction)
-- Never message after 22:00 local time.
-- Never send more than 5 messages to one user per day (this is also enforced in code).
-- Never fabricate workout history. Only reference sessions confirmed in the data.
-- After 3 unanswered messages today, call cancel_followup() and stop messaging.
-- If the user has already recorded a workout today, do not nudge.
-
-## Conversation Style
-- All messages in Korean.
-- 2–4 sentences maximum. No walls of text.
-- Sound like a friend, not a notification system. Never use words like "알림", "안내", "시스템".
-- Reference specific details from history to show you remember: muscle groups, streaks, things they said.
-- Never repeat the same framing twice in a row. Vary your angle.
-
-## Psychology Principles (apply naturally, never formulaically)
-- **Specificity**: Suggest a concrete workout (e.g., 등, 이두) based on what they last did — never just "운동".
-- **Loss aversion**: Reference streaks when real and meaningful. Never invent them.
-- **Commitment anchoring**: If the user states a plan, write it down with save_note(), confirm it warmly, hold them to it.
-- **Autonomy**: Always offer an easy out. Never guilt-trip. Make going feel better than not going, but don't punish skipping.
-- **Specific acknowledgment**: When they complete a workout, celebrate what they actually did by name.
-- **Reduced commitment**: If the user seems reluctant, lower the bar ("15분만이라도 어때요?").
-
-## Memory Policy
-- After every meaningful incoming user message, call save_note() to capture: commitments, injury mentions, skip reasons, emotional state, goal changes.
-- Always read get_notes() before composing any message.
-- Notable things to record: "committed to gym at 21:00", "mentioned knee pain", "회식 today", "said this week is a business trip".
-
-## Follow-up Scheduling
-- If user commits to going at time T: schedule_followup(delay=minutes_until(T) - 30, reason="pre-commitment reminder")
-- If user does not respond within 30 min of your message: schedule_followup(delay=30, reason="no response nudge")
-- If committed time T passes by 10+ min with no update: send one gentle overdue check-in, then schedule_followup(delay=60, reason="final check")
-- When user reports completion or explicitly skips: cancel_followup()
-
-## Recording Workouts
-- When user reports completing a workout (any natural phrasing, e.g., "ㅇㅇ 오늘 등이랑 이두 했어"), parse the muscle groups and call save_workout_record().
-- Do not require structured input — understand what they say naturally.
-- Confirm warmly and reference the updated streak.
-
-## Trigger Reason
-{trigger_reason}
-
-## Current User Context
-{user_context}
-"""
-```
-
-### MessageCrafter Sub-Agent Prompt
-
-```python
-# agent/prompts/message_crafter.py
-
-# This sub-agent is invoked by the Orchestrator as a tool when it wants
-# a high-quality message for a specific psychological goal.
-
-INITIAL_NUDGE_PROMPT = """
-Write a KakaoTalk message in Korean to nudge the user to exercise after detecting they have left work.
-
-Rules:
-- 2 sentences maximum
-- Reference the last 1-2 workouts specifically (muscle groups and day)
-- Suggest today's workout based on what they haven't done recently
-- Casual, warm tone — like a friend who remembers
-- Include one relevant emoji
-- Do NOT say "운동하세요" or any command form. Make it an invitation.
-
-User's recent workouts:
-{workout_history}
-
-Current streak: {streak}
-
-Recent notes: {notes}
-
-Write only the message text. No explanation.
-"""
-
-COMMITMENT_CONFIRM_PROMPT = """
-Write a short, warm Korean KakaoTalk reply confirming the user's workout plan.
-
-The user said: "{user_message}"
-Extracted plan: go at {committed_time}, workout type: {workout_type}
-
-Rules:
-- 1-2 sentences only
-- Sound happy and supportive, not clinical
-- Optionally include a small encouragement about the specific workout
-- Do not repeat their exact words back to them
-
-Write only the message text.
-"""
-
-PRE_COMMITMENT_REMINDER_PROMPT = """
-Write a short Korean KakaoTalk reminder that it's almost time for the user's planned gym session.
-
-Committed time: {committed_time} (in ~30 minutes)
-Workout type: {workout_type}
-Current streak: {streak}
-
-Rules:
-- 1-2 sentences
-- Frame it as their own plan, not your reminder ("슬슬 준비하실 시간이죠?" not "운동 시간입니다")
-- Casual and energetic
-
-Write only the message text.
-"""
-
-OVERDUE_CHECKIN_PROMPT = """
-Write a non-judgmental Korean KakaoTalk check-in for when the user's committed gym time has passed.
-
-Committed time: {committed_time}
-Minutes overdue: {minutes_overdue}
-
-Rules:
-- 1-2 sentences
-- Open-ended — they might already be working out
-- Zero guilt or disappointment
-- Ask them to message when done
-
-Write only the message text.
-"""
-
-NO_RESPONSE_RENUDGE_PROMPT = """
-Write a Korean KakaoTalk re-nudge message. This is nudge #{nudge_number} today (max 3).
-
-Rules for each nudge number:
-- Nudge 1: Streak + warmth ("X일 스트릭인데 오늘 하면 X+1일이에요 💪")
-- Nudge 2: Reduced commitment — make it feel easy ("15분만이라도 어때요?")
-- Nudge 3: Soft opt-out — fully release pressure ("오늘 힘드시면 내일 봐요 😄")
-
-Never repeat the previous message's framing.
-
-Current streak: {streak}
-Previous message sent: "{previous_message}"
-
-Write only the message text.
-"""
-
-COMPLETION_CELEBRATION_PROMPT = """
-Write a warm Korean KakaoTalk celebration for the user completing their workout.
-
-What they did: {muscle_groups}
-Updated streak: {streak}
-Workouts this week: {weekly_count} / {weekly_goal}
-
-Rules:
-- Name what they actually did (do not be generic)
-- Celebrate the streak if it is meaningful (3+ days)
-- Plant a gentle seed for tomorrow without pressure (optional, if appropriate)
-- 2-3 sentences maximum
-
-Write only the message text.
-"""
-
-SKIP_ACKNOWLEDGMENT_PROMPT = """
-Write a zero-judgment Korean KakaoTalk reply for when the user skips their workout.
-
-Reason they gave: "{skip_reason}"
-Current streak (now broken or preserved): {streak}
-Workouts this week: {weekly_count} / {weekly_goal}
-
-Rules:
-- Fully accept the skip. No guilt, no "next time be better"
-- If they gave a social reason (회식, etc.) you can make a light joke
-- Keep it brief and warm — preserve the relationship
-- End on a forward-looking but unpressured note
-
-Write only the message text.
-"""
-
-WEEKLY_SUMMARY_PROMPT = """
-Write a weekly workout summary in Korean for a KakaoTalk message.
-
-This week: {weekly_count} workouts out of {weekly_goal} goal
-Muscle groups trained: {muscle_groups_this_week}
-Current streak: {streak}
-Notable events this week (from notes): {notable_notes}
-
-Rules:
-- 3-4 sentences
-- Lead with what they accomplished, not what they missed
-- Acknowledge any gap gently and briefly if relevant
-- End with energy and positivity for next week
-- Reference specific muscle groups they trained
-
-Write only the message text.
-"""
-```
-
-### WorkoutHistoryAnalyzer Sub-Agent Prompt
-
-```python
-# agent/prompts/history_analysis.py
-
-HISTORY_ANALYSIS_PROMPT = """
-Analyze this user's workout history and return a structured JSON summary.
-
-Workout log (date, muscle_groups):
-{workout_log}
-
-Return a JSON object with these fields:
-- current_streak: int (consecutive days ending today or yesterday)
-- longest_streak: int
-- last_workout_date: string (YYYY-MM-DD)
-- days_since_last_workout: int
-- most_trained: string (most frequent muscle group)
-- least_trained: string (least frequent muscle group in trained set)
-- muscle_rotation_suggestion: string (what muscle group to suggest next based on last 3 sessions)
-- patterns: list of strings (notable observations, e.g. "never exercises on Fridays", "always pairs 등 and 이두")
-- long_absence: bool (true if 5+ day gap exists recently)
-- best_week_count: int (highest weekly workout count ever)
-- this_week_count: int
-
-Return only valid JSON. No explanation.
-"""
-
-NOTE_EXTRACTION_PROMPT = """
-The user sent this KakaoTalk message: "{user_message}"
-
-Extract any notable facts worth saving as agent notes. Return a JSON array of strings.
-
-Look for:
-- Commitments: "X시에 갈게", "내일 갈게", "오늘은 Y 할게"
-- Physical issues: pain, injury, soreness, illness mentions
-- Skip reasons: 회식, 출장, 피곤, 약속
-- Emotional state: very tired, stressed, motivated
-- Goal changes: "주 X회 해볼게"
-- Completed workout details: muscle groups done
-
-If nothing notable: return [].
-
-Example output: ["committed to gym at 21:00", "mentioned right knee pain"]
-
-Return only a JSON array. No explanation.
-"""
-```
-
----
-
-## Scheduler Implementation
-
-```python
-# scheduler/jobs.py
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-
-scheduler = AsyncIOScheduler(
-    jobstores={"default": SQLAlchemyJobStore(url=settings.DATABASE_URL)},
-    timezone="Asia/Seoul",
-)
-
-async def schedule_user_followup(user_id: str, delay_minutes: int, reason: str):
-    """Schedule a one-time agent invocation for a specific user."""
-    await cancel_user_followup(user_id)  # Cancel any existing follow-up
-
-    job_id = f"followup_{user_id}"
-    run_at = datetime.now(tz=KST) + timedelta(minutes=delay_minutes)
-
-    scheduler.add_job(
-        invoke_agent_job,
-        trigger="date",
-        run_date=run_at,
-        id=job_id,
-        args=[user_id, reason],
-        replace_existing=True,
-    )
-
-    await db.upsert_scheduled_followup(user_id, job_id=job_id, reason=reason, scheduled_for=run_at)
-
-async def cancel_user_followup(user_id: str):
-    job_id = f"followup_{user_id}"
-    try:
-        scheduler.remove_job(job_id)
-    except JobLookupError:
-        pass
-    await db.delete_scheduled_followup(user_id)
-
-async def invoke_agent_job(user_id: str, reason: str):
-    """Called by APScheduler. Invokes the Orchestrator for a specific user."""
-    from agent.orchestrator import invoke_agent
-    await invoke_agent(user_id=user_id, trigger_reason=reason)
-
-
-# Cron job: check all users every 5 minutes during active hours (17:00–22:00 KST)
-@scheduler.scheduled_job("cron", minute="*/5", hour="17-21", timezone="Asia/Seoul")
-async def check_all_users():
-    users = await db.get_active_users()
-    for user in users:
-        if await should_invoke_for_user(user):
-            await invoke_agent(user_id=str(user.id), trigger_reason="scheduled_check")
-
-# Cron job: weekly summary every Sunday at 21:00 KST
-@scheduler.scheduled_job("cron", day_of_week="sun", hour=21, timezone="Asia/Seoul")
-async def send_weekly_summaries():
-    users = await db.get_active_users()
-    for user in users:
-        await invoke_agent(user_id=str(user.id), trigger_reason="weekly_summary")
-```
-
----
-
-## Kakao API Integration
-
-### OAuth Flow
-
-```python
-# kakao/auth.py
-import httpx
-
-KAKAO_TOKEN_URL = "https://kauth.kakao.com/oauth/token"
-KAKAO_USER_URL = "https://kapi.kakao.com/v2/user/me"
-
-async def exchange_code_for_tokens(code: str) -> dict:
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(KAKAO_TOKEN_URL, data={
-            "grant_type": "authorization_code",
-            "client_id": settings.KAKAO_REST_API_KEY,
-            "client_secret": settings.KAKAO_CLIENT_SECRET,
-            "redirect_uri": settings.KAKAO_REDIRECT_URI,
-            "code": code,
-        })
-        resp.raise_for_status()
-        return resp.json()  # access_token, refresh_token, expires_in
-
-async def refresh_access_token(refresh_token: str) -> dict:
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(KAKAO_TOKEN_URL, data={
-            "grant_type": "refresh_token",
-            "client_id": settings.KAKAO_REST_API_KEY,
-            "client_secret": settings.KAKAO_CLIENT_SECRET,
-            "refresh_token": refresh_token,
-        })
-        resp.raise_for_status()
-        return resp.json()
-
-async def get_valid_token(user_id: str) -> str:
-    """Returns a valid access token, refreshing if needed."""
-    user = await db.get_user(user_id)
-    if user.token_expires_at < datetime.now(tz=UTC) + timedelta(minutes=5):
-        tokens = await refresh_access_token(user.refresh_token)
-        await db.update_user_tokens(user_id, tokens)
-        return tokens["access_token"]
-    return user.access_token
-```
-
-### Sending Messages
-
-```python
-# kakao/message.py
-SEND_MESSAGE_URL = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
-
-async def send_message(user_id: str, text: str) -> None:
-    """Send a plain text KakaoTalk message to the user (send-to-me API)."""
-    token = await get_valid_token(user_id)
-    import json
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            SEND_MESSAGE_URL,
-            headers={"Authorization": f"Bearer {token}"},
-            data={
-                "template_object": json.dumps({
-                    "object_type": "text",
-                    "text": text,
-                    "link": {"web_url": settings.APP_BASE_URL},
-                })
-            }
-        )
-        if resp.status_code == 401:
-            # Token expired mid-flight — refresh and retry once
-            await refresh_access_token_for_user(user_id)
-            token = await get_valid_token(user_id)
-            resp = await client.post(SEND_MESSAGE_URL, ...)
-        resp.raise_for_status()
-```
-
-### Kakao Local API — Gym Search
-
-```python
-# kakao/location.py
-KAKAO_LOCAL_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
-
-async def search_nearby_gyms(lat: float, lng: float, radius: int = 1000) -> list:
-    cache_key = f"gym_search:{lat:.4f}:{lng:.4f}"
-    cached = await redis.get(cache_key)
-    if cached:
-        return json.loads(cached)
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            KAKAO_LOCAL_URL,
-            headers={"Authorization": f"KakaoAK {settings.KAKAO_REST_API_KEY}"},
-            params={"query": "헬스장", "x": lng, "y": lat, "radius": radius, "sort": "distance"},
-        )
-        resp.raise_for_status()
-        gyms = resp.json()["documents"]
-
-    await redis.setex(cache_key, 3600, json.dumps(gyms))
-    return gyms
-```
-
----
-
-## Webhook Handler
-
-```python
-# routes/webhook.py
-from fastapi import APIRouter, Request, BackgroundTasks
-
-router = APIRouter()
-
-@router.post("/webhook/message")
-async def kakao_message_webhook(request: Request, background_tasks: BackgroundTasks):
-    """
-    Receives incoming KakaoTalk messages from users.
-    Must respond with 200 OK immediately; process agent in background.
-    """
-    payload = await request.json()
-    user_kakao_id = payload["userRequest"]["user"]["id"]
-    user_message = payload["userRequest"]["utterance"]
-
-    user = await db.get_user_by_kakao_id(user_kakao_id)
-    if not user:
-        return {"version": "2.0", "template": {"outputs": []}}
-
-    # Save raw turn immediately
-    await db.insert_conversation_turn(str(user.id), role="user", content=user_message)
-
-    # Process agent asynchronously — do not block the webhook response
-    background_tasks.add_task(
-        invoke_agent,
-        user_id=str(user.id),
-        trigger_reason="incoming_user_message",
-        user_message=user_message,
-    )
-
-    return {"version": "2.0", "template": {"outputs": []}}
-```
-
----
-
-## Message Guard (Hard Daily Cap)
-
-```python
-# utils/message_guard.py
-async def can_send(user_id: str) -> bool:
-    """Enforced in code — the LLM cannot bypass this."""
-    today = date.today().isoformat()
-    count = await db.get_daily_message_count(user_id, today)
-    current_hour = datetime.now(tz=KST).hour
-    if current_hour >= settings.AGENT_SILENT_AFTER_HOUR:
-        return False
-    return count < settings.MAX_DAILY_MESSAGES
-
-async def increment(user_id: str) -> None:
-    today = date.today().isoformat()
-    await db.increment_daily_message_count(user_id, today)
-```
-
----
-
-## Context Builder
-
-```python
-# agent/orchestrator.py (context helper)
-async def build_user_context(user_id: str) -> str:
-    user = await db.get_user(user_id)
-    streak = await db.get_streak(user_id)
-    today_workout = await db.get_workout_session_today(user_id)
-    message_count_today = await db.get_daily_message_count(user_id, date.today().isoformat())
-    pending_followup = await db.get_scheduled_followup(user_id)
-
-    return f"""
-User: {user.kakao_nickname}
-Weekly goal: {user.weekly_goal_count} sessions/week
-Current streak: {streak.current_streak} days (longest: {streak.longest_streak})
-Last workout: {streak.last_workout_date}
-Worked out today: {'Yes' if today_workout else 'No'}
-Messages sent today: {message_count_today} / {settings.MAX_DAILY_MESSAGES}
-Pending follow-up: {pending_followup.reason if pending_followup else 'None'} at {pending_followup.scheduled_for if pending_followup else 'N/A'}
-Current local time: {datetime.now(tz=KST).strftime('%H:%M')}
-"""
-```
-
----
-
-## Notable Event Detection (Automatic)
-
-The `WorkoutHistoryAnalyzer` sub-agent runs at the start of each day's first invocation and populates the Orchestrator's context. The Orchestrator is instructed to watch for these events in notes and naturally incorporate them:
-
-| Event | Detection |
-|---|---|
-| Injury mention | Note extraction finds pain/injury keywords: "무릎", "허리", "삐었어", "다쳤어" |
-| Streak milestone | Analyzer: current_streak equals longest_streak |
-| Long absence | Analyzer: days_since_last_workout >= 5 |
-| Implicit rest day | Analyzer pattern: user never exercises on weekday X for 3+ consecutive weeks |
-| External obstacle | Note extraction: "출장", "회식", "감기", "입원" |
-| Muscle pair habit | Analyzer pattern: always trains same muscle groups together |
-| Goal change | Note extraction: "주 X회" + "해볼게" or similar |
-
----
-
-## Redis Usage
-
-| Key Pattern | TTL | Purpose |
+| Phase | Status | Scope |
 |---|---|---|
-| `token:{user_id}` | 6h | Cached Kakao access token |
-| `gym_search:{lat}:{lng}` | 1h | Cached Kakao Local gym results |
-| `location:{user_id}` | 5m | Last known location status |
-
-All other state is in PostgreSQL (durable, queryable).
-
----
-
-## Error Handling
-
-- **Kakao 401**: Refresh token and retry once. If refresh fails, mark user as `needs_reauth` in DB, suppress nudges.
-- **Kakao 429**: Exponential backoff with jitter. Log and skip if rate limited.
-- **LangChain agent exception**: Catch, log, do not crash. The scheduler will retry on next cron tick.
-- **APScheduler job failure**: Logged automatically. Failed jobs do not block other users.
-- **Webhook timeout**: Always return 200 immediately. All agent work is in BackgroundTasks.
+| 1 | ✅ | Kakao OAuth, send-to-me, webhook receiver, DB schema |
+| 2 | ✅ | LangChain agent prototype with tools + manual trigger (to be replaced) |
+| 3 | ✅ | **Foundation reset on Discord:** Agent SDK migration, channel abstraction + Discord adapter, platform-neutral users, memory store, guard split, Alembic. Ends with a working reactive DM conversation |
+| 4 | 🔲 | **Proactive loop (end-to-end drill):** timing windows, follow-ups, escalation ladder, commitment tracking — all over Discord DMs |
+| 5 | 🔲 | **Expertise:** training engine, knowledge base, Q&A, injury handling |
+| 6 | 🔲 | **Personas** + personality variables, onboarding flow (`/start`) |
+| 7 | 🔲 | **Beta (Discord):** eval suite, weekly recap, privacy commands, hardening, prompt tuning |
+| 8 | 💤 | **Kakao Channels expansion:** `channels/kakao.py`, gated on the prerequisites in §10.3 |
 
 ---
 
-## Security
+## 17. Open Questions
 
-- Encrypt `access_token` and `refresh_token` columns at rest using `pgcrypto` or application-level AES-256.
-- Validate incoming webhook requests using HMAC signature if Kakao provides one; otherwise validate the user ID against the DB.
-- Rate-limit `/auth/kakao` to 10 req/min per IP.
-- Never log access tokens, location coordinates, or conversation content to stdout in production.
-- Implement `DELETE /user/me` for full GDPR/PIPA-compliant data deletion.
-
----
-
-## Implementation Priority
-
-See [`docs/PHASES.md`](docs/PHASES.md) for the full phase development log — what was built, what was verified, and deviations from the original plan. **Check the verification checklist in that file before committing each phase.**
-
-1. **Phase 1** ✅ — Kakao OAuth + send-to-me message + webhook receiver + DB schema
-2. **Phase 2** 🔲 — LangChain agent skeleton with tools, system prompt, manual trigger via HTTP
-3. **Phase 3** 🔲 — APScheduler integration, commute detection, follow-up scheduling, note save/read loop
-4. **Phase 4** 🔲 — Sub-agents (WorkoutHistoryAnalyzer, MessageCrafter), ConversationSummaryBufferMemory, full prompt set
-5. **Phase 5** 🔲 — Beta, prompt tuning, edge cases (injury detection, long absence re-entry, weekly summary)
+- Kakao expansion: business registration timing, and how Kakao classifies personalized nudges (ad or not) (§10.3)
+- Persona names and character sheets (Korean copywriting; needs a native-speaker review)
+- Knowledge base sourcing and who signs off on content
+- Whether location/geofencing and calendar signals are worth adding at the Kakao stage, or learned timing is enough

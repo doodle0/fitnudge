@@ -16,3 +16,6 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Agent SDK CLI state (transcripts)
+.claude-agent/

@@ -1,5 +1,6 @@
 """
 Typed async query helpers for all database operations.
+Memory-entry queries live in memory/store.py.
 """
 from __future__ import annotations
 
@@ -7,11 +8,12 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select, update, delete, func
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import (
-    AgentNote,
+    ChannelIdentity,
     ConversationTurn,
     DailyMessageCount,
     ScheduledFollowup,
@@ -19,6 +21,7 @@ from db.models import (
     User,
     WorkoutSession,
 )
+from utils.time_utils import start_of_day_kst, today_kst
 
 
 # ---------------------------------------------------------------------------
@@ -60,15 +63,15 @@ async def upsert_user_from_kakao(
         user = User(
             kakao_id=kakao_id,
             kakao_nickname=kakao_nickname,
+            display_name=kakao_nickname,
+            active_channel="kakao",
             access_token=access_token,
             refresh_token=refresh_token,
             token_expires_at=token_expires_at,
         )
         session.add(user)
-        # Also create an empty streak row
         await session.flush()  # get user.id
-        streak = Streak(user_id=user.id)
-        session.add(streak)
+        session.add(Streak(user_id=user.id))
     await session.commit()
     await session.refresh(user)
     return user
@@ -95,25 +98,87 @@ async def update_user_tokens(
 
 
 # ---------------------------------------------------------------------------
+# Channel identity queries
+# ---------------------------------------------------------------------------
+
+async def get_identity(session: AsyncSession, channel: str, external_id: str) -> Optional[ChannelIdentity]:
+    result = await session.execute(
+        select(ChannelIdentity).where(
+            ChannelIdentity.channel == channel,
+            ChannelIdentity.external_id == external_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_identity_for_user(session: AsyncSession, user_id: str, channel: str) -> Optional[ChannelIdentity]:
+    result = await session.execute(
+        select(ChannelIdentity).where(
+            ChannelIdentity.user_id == uuid.UUID(user_id),
+            ChannelIdentity.channel == channel,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_or_create_user_for_identity(
+    session: AsyncSession,
+    channel: str,
+    external_id: str,
+    display_name: str | None = None,
+) -> tuple[User, ChannelIdentity, bool]:
+    """Return (user, identity, created). Creates a user + streak row on first contact."""
+    identity = await get_identity(session, channel, external_id)
+    if identity is not None:
+        user = await session.get(User, identity.user_id)
+        return user, identity, False
+
+    user = User(display_name=display_name, active_channel=channel)
+    session.add(user)
+    await session.flush()
+    identity = ChannelIdentity(user_id=user.id, channel=channel, external_id=external_id)
+    session.add_all([identity, Streak(user_id=user.id)])
+    await session.commit()
+    await session.refresh(user)
+    await session.refresh(identity)
+    return user, identity, True
+
+
+async def set_opted_in_proactive(session: AsyncSession, user_id: str, channel: str, opted_in: bool) -> None:
+    await session.execute(
+        update(ChannelIdentity)
+        .where(ChannelIdentity.user_id == uuid.UUID(user_id), ChannelIdentity.channel == channel)
+        .values(opted_in_proactive=opted_in)
+    )
+    await session.commit()
+
+
+async def mark_onboarding_complete(session: AsyncSession, user_id: str) -> None:
+    await session.execute(
+        update(User).where(User.id == uuid.UUID(user_id)).values(onboarding_complete=True)
+    )
+    await session.commit()
+
+
+# ---------------------------------------------------------------------------
 # Workout session queries
 # ---------------------------------------------------------------------------
 
 async def get_workout_sessions(session: AsyncSession, user_id: str, days: int = 30) -> list[WorkoutSession]:
-    since = date.today() - timedelta(days=days)
+    since = today_kst() - timedelta(days=days)
     result = await session.execute(
         select(WorkoutSession)
         .where(WorkoutSession.user_id == uuid.UUID(user_id), WorkoutSession.date >= since)
-        .order_by(WorkoutSession.date.desc())
+        .order_by(WorkoutSession.date.desc(), WorkoutSession.created_at.desc())
     )
     return list(result.scalars().all())
 
 
 async def get_workout_session_today(session: AsyncSession, user_id: str) -> Optional[WorkoutSession]:
     result = await session.execute(
-        select(WorkoutSession).where(
-            WorkoutSession.user_id == uuid.UUID(user_id),
-            WorkoutSession.date == date.today(),
-        )
+        select(WorkoutSession)
+        .where(WorkoutSession.user_id == uuid.UUID(user_id), WorkoutSession.date == today_kst())
+        .limit(1)
     )
     return result.scalar_one_or_none()
 
@@ -125,10 +190,11 @@ async def insert_workout_session(
     raw_user_message: str = "",
     agent_notes_text: str = "",
     source: str = "user_report",
+    day: date | None = None,
 ) -> WorkoutSession:
     ws = WorkoutSession(
         user_id=uuid.UUID(user_id),
-        date=date.today(),
+        date=day or today_kst(),
         muscle_groups=muscle_groups,
         raw_user_message=raw_user_message,
         agent_notes=agent_notes_text,
@@ -156,11 +222,10 @@ async def update_streak(session: AsyncSession, user_id: str) -> Streak:
         streak = Streak(user_id=uuid.UUID(user_id))
         session.add(streak)
 
-    today = date.today()
+    today = today_kst()
     yesterday = today - timedelta(days=1)
 
     if streak.last_workout_date == today:
-        # Already recorded today — no change
         return streak
 
     if streak.last_workout_date == yesterday:
@@ -177,26 +242,17 @@ async def update_streak(session: AsyncSession, user_id: str) -> Streak:
     return streak
 
 
-# ---------------------------------------------------------------------------
-# Agent notes queries
-# ---------------------------------------------------------------------------
-
-async def get_notes(session: AsyncSession, user_id: str, days: int = 14) -> list[AgentNote]:
-    since = date.today() - timedelta(days=days)
+async def count_workouts_this_week(session: AsyncSession, user_id: str) -> int:
+    """Sessions since Monday (KST)."""
+    today = today_kst()
+    monday = today - timedelta(days=today.weekday())
     result = await session.execute(
-        select(AgentNote)
-        .where(AgentNote.user_id == uuid.UUID(user_id), AgentNote.date >= since)
-        .order_by(AgentNote.date.desc(), AgentNote.created_at.desc())
+        select(func.count(func.distinct(WorkoutSession.date))).where(
+            WorkoutSession.user_id == uuid.UUID(user_id),
+            WorkoutSession.date >= monday,
+        )
     )
-    return list(result.scalars().all())
-
-
-async def insert_note(session: AsyncSession, user_id: str, note: str) -> AgentNote:
-    an = AgentNote(user_id=uuid.UUID(user_id), date=date.today(), note=note)
-    session.add(an)
-    await session.commit()
-    await session.refresh(an)
-    return an
+    return int(result.scalar_one())
 
 
 # ---------------------------------------------------------------------------
@@ -204,44 +260,77 @@ async def insert_note(session: AsyncSession, user_id: str, note: str) -> AgentNo
 # ---------------------------------------------------------------------------
 
 async def insert_conversation_turn(
-    session: AsyncSession, user_id: str, role: str, content: str
+    session: AsyncSession, user_id: str, role: str, content: str, proactive: bool = False
 ) -> ConversationTurn:
-    ct = ConversationTurn(user_id=uuid.UUID(user_id), role=role, content=content)
+    ct = ConversationTurn(user_id=uuid.UUID(user_id), role=role, content=content, proactive=proactive)
     session.add(ct)
     await session.commit()
     await session.refresh(ct)
     return ct
 
 
+async def get_recent_turns(session: AsyncSession, user_id: str, limit: int = 20) -> list[ConversationTurn]:
+    """Most recent turns, returned oldest-first."""
+    result = await session.execute(
+        select(ConversationTurn)
+        .where(ConversationTurn.user_id == uuid.UUID(user_id))
+        .order_by(ConversationTurn.created_at.desc())
+        .limit(limit)
+    )
+    return list(reversed(result.scalars().all()))
+
+
+async def count_unanswered_proactive_today(session: AsyncSession, user_id: str) -> int:
+    """Proactive agent turns today that came after the user's most recent message."""
+    uid = uuid.UUID(user_id)
+    last_user_at = (
+        await session.execute(
+            select(func.max(ConversationTurn.created_at)).where(
+                ConversationTurn.user_id == uid, ConversationTurn.role == "user"
+            )
+        )
+    ).scalar_one()
+    since = start_of_day_kst()
+    if last_user_at is not None and last_user_at > since:
+        since = last_user_at
+    result = await session.execute(
+        select(func.count()).where(
+            ConversationTurn.user_id == uid,
+            ConversationTurn.role == "agent",
+            ConversationTurn.proactive.is_(True),
+            ConversationTurn.created_at > since,
+        )
+    )
+    return int(result.scalar_one())
+
+
 # ---------------------------------------------------------------------------
 # Daily message count queries
 # ---------------------------------------------------------------------------
 
-async def get_daily_message_count(session: AsyncSession, user_id: str, day: date = None) -> int:
-    day = day or date.today()
+async def get_daily_counts(session: AsyncSession, user_id: str, day: date | None = None) -> tuple[int, int]:
+    """Return (proactive_count, reply_count) for the user's local day."""
     result = await session.execute(
         select(DailyMessageCount).where(
             DailyMessageCount.user_id == uuid.UUID(user_id),
-            DailyMessageCount.date == day,
+            DailyMessageCount.date == (day or today_kst()),
         )
     )
     row = result.scalar_one_or_none()
-    return row.count if row else 0
+    return (row.proactive_count, row.reply_count) if row else (0, 0)
 
 
-async def increment_daily_message_count(session: AsyncSession, user_id: str) -> None:
-    day = date.today()
-    result = await session.execute(
-        select(DailyMessageCount).where(
-            DailyMessageCount.user_id == uuid.UUID(user_id),
-            DailyMessageCount.date == day,
-        )
+async def increment_daily_count(session: AsyncSession, user_id: str, proactive: bool) -> None:
+    """Atomic upsert so concurrent sends never lose a count."""
+    column = "proactive_count" if proactive else "reply_count"
+    stmt = pg_insert(DailyMessageCount).values(
+        user_id=uuid.UUID(user_id), date=today_kst(), **{column: 1}
     )
-    row = result.scalar_one_or_none()
-    if row:
-        row.count += 1
-    else:
-        session.add(DailyMessageCount(user_id=uuid.UUID(user_id), date=day, count=1))
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["user_id", "date"],
+        set_={column: getattr(DailyMessageCount, column) + 1},
+    )
+    await session.execute(stmt)
     await session.commit()
 
 

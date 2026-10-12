@@ -1,60 +1,82 @@
 """
 FitNudge — FastAPI application entry point.
+
+The Discord gateway client and APScheduler run inside this process, on the same event loop.
+Run database migrations first: `uv run alembic upgrade head`.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
-from db.models import create_tables
-from routes.auth import router as auth_router
-from routes.webhook import router as webhook_router
 from routes.internal import router as internal_router
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+logging.getLogger("discord").setLevel(logging.WARNING)
+log = logging.getLogger(__name__)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    from agent import dispatch
+    from agent.runtime import purge_stale_transcripts
+    from scheduler.jobs import scheduler
+
+    scheduler.start()
+    purge_stale_transcripts()
+    scheduler.add_job(purge_stale_transcripts, "interval", minutes=30,
+                      id="purge_agent_transcripts", replace_existing=True)
+
+    bot = None
+    bot_task: asyncio.Task | None = None
+    if settings.discord_bot_token:
+        from discord_bot.bot import FitNudgeBot
+
+        bot = FitNudgeBot()
+        bot_task = asyncio.create_task(bot.start(settings.discord_bot_token), name="discord-gateway")
+        bot_task.add_done_callback(_log_bot_exit)
+        if settings.discord_application_id:
+            log.info(
+                "Invite the bot: https://discord.com/oauth2/authorize?client_id=%s&scope=bot%%20applications.commands",
+                settings.discord_application_id,
+            )
+    else:
+        log.warning("DISCORD_BOT_TOKEN is not set — Discord channel disabled.")
+
+    log.info("FitNudge started | channel=%s | model=%s", settings.primary_channel, settings.agent_model)
+    try:
+        yield
+    finally:
+        if bot is not None:
+            await bot.close()
+        if bot_task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await bot_task
+        with contextlib.suppress(TimeoutError):
+            await dispatch.wait_idle(timeout=20)
+        scheduler.shutdown(wait=False)
+
+
+def _log_bot_exit(task: asyncio.Task) -> None:
+    if not task.cancelled() and task.exception() is not None:
+        log.error("Discord client stopped with an error", exc_info=task.exception())
+
 
 app = FastAPI(
     title="FitNudge",
-    description="LLM-powered KakaoTalk fitness accountability bot",
-    version="0.1.0",
+    description="Claude-powered workout companion (Discord now, KakaoTalk later)",
+    version="0.2.0",
+    lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tighten in production
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.include_router(auth_router)
-app.include_router(webhook_router)
 app.include_router(internal_router)
-
-
-@app.on_event("startup")
-async def on_startup():
-    # Create all DB tables (idempotent)
-    await create_tables()
-
-    # Start APScheduler
-    from scheduler.jobs import scheduler
-    if not scheduler.running:
-        scheduler.start()
-
-    logging.getLogger(__name__).info("FitNudge started. DB tables ensured. Scheduler running.")
-
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    from scheduler.jobs import scheduler
-    if scheduler.running:
-        scheduler.shutdown(wait=False)
 
 
 @app.get("/health")

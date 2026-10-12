@@ -1,79 +1,109 @@
--- FitNudge Database Schema
--- PostgreSQL 15+
+-- FitNudge Database Schema (PostgreSQL 15+)
+-- Reference only — generated from db/models.py. Apply changes with Alembic:
+--   uv run alembic upgrade head
 
--- Users
-CREATE TABLE IF NOT EXISTS users (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  kakao_id BIGINT UNIQUE NOT NULL,
-  kakao_nickname TEXT,
-  access_token TEXT NOT NULL,
-  refresh_token TEXT NOT NULL,
-  token_expires_at TIMESTAMPTZ NOT NULL,
-  workplace_lat TEXT,
-  workplace_lng TEXT,
-  default_departure_time TIME,
-  weekly_goal_count INT DEFAULT 3,
-  preferred_exercises TEXT[],
-  timezone TEXT DEFAULT 'Asia/Seoul',
-  onboarding_complete BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
+CREATE TABLE users (
+	id UUID NOT NULL, 
+	display_name TEXT, 
+	active_channel TEXT DEFAULT 'discord' NOT NULL, 
+	kakao_id BIGINT, 
+	kakao_nickname TEXT, 
+	access_token TEXT, 
+	refresh_token TEXT, 
+	token_expires_at TIMESTAMP WITH TIME ZONE, 
+	workplace_lat VARCHAR, 
+	workplace_lng VARCHAR, 
+	default_departure_time TIME WITHOUT TIME ZONE, 
+	weekly_goal_count INTEGER, 
+	preferred_exercises TEXT[], 
+	timezone TEXT, 
+	onboarding_complete BOOLEAN, 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT now(), 
+	updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(), 
+	PRIMARY KEY (id), 
+	UNIQUE (kakao_id)
 );
 
--- Workout sessions
-CREATE TABLE IF NOT EXISTS workout_sessions (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  date DATE NOT NULL,
-  muscle_groups TEXT[] NOT NULL,
-  raw_user_message TEXT,
-  agent_notes TEXT,
-  source TEXT CHECK (source IN ('user_report', 'geofence', 'manual')),
-  created_at TIMESTAMPTZ DEFAULT NOW()
+CREATE TABLE channel_identities (
+	id UUID NOT NULL, 
+	user_id UUID NOT NULL, 
+	channel TEXT NOT NULL, 
+	external_id TEXT NOT NULL, 
+	opted_in_proactive BOOLEAN DEFAULT false NOT NULL, 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT now(), 
+	PRIMARY KEY (id), 
+	CONSTRAINT uq_channel_identities_channel_external_id UNIQUE (channel, external_id), 
+	CONSTRAINT uq_channel_identities_user_channel UNIQUE (user_id, channel), 
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
 );
 
--- Date-keyed notes (agent memory)
-CREATE TABLE IF NOT EXISTS agent_notes (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  date DATE NOT NULL DEFAULT CURRENT_DATE,
-  note TEXT NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_agent_notes_user_date ON agent_notes(user_id, date DESC);
-
--- Conversation history
-CREATE TABLE IF NOT EXISTS conversation_turns (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  role TEXT CHECK (role IN ('agent', 'user')) NOT NULL,
-  content TEXT NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_conversation_turns_user_created ON conversation_turns(user_id, created_at DESC);
-
--- Streak tracking
-CREATE TABLE IF NOT EXISTS streaks (
-  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  current_streak INT DEFAULT 0,
-  longest_streak INT DEFAULT 0,
-  last_workout_date DATE,
-  updated_at TIMESTAMPTZ DEFAULT NOW()
+CREATE TABLE conversation_turns (
+	id UUID NOT NULL, 
+	user_id UUID NOT NULL, 
+	role TEXT NOT NULL, 
+	content TEXT NOT NULL, 
+	proactive BOOLEAN DEFAULT false NOT NULL, 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT now(), 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
 );
 
--- Daily message count guard
-CREATE TABLE IF NOT EXISTS daily_message_counts (
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  date DATE NOT NULL DEFAULT CURRENT_DATE,
-  count INT DEFAULT 0,
-  PRIMARY KEY (user_id, date)
+CREATE TABLE daily_message_counts (
+	user_id UUID NOT NULL, 
+	date DATE NOT NULL, 
+	proactive_count INTEGER DEFAULT 0 NOT NULL, 
+	reply_count INTEGER DEFAULT 0 NOT NULL, 
+	PRIMARY KEY (user_id, date), 
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
 );
 
--- Scheduled follow-ups
-CREATE TABLE IF NOT EXISTS scheduled_followups (
-  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  job_id TEXT NOT NULL,
-  reason TEXT,
-  scheduled_for TIMESTAMPTZ,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+CREATE TABLE scheduled_followups (
+	user_id UUID NOT NULL, 
+	job_id TEXT NOT NULL, 
+	reason TEXT, 
+	scheduled_for TIMESTAMP WITH TIME ZONE, 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT now(), 
+	PRIMARY KEY (user_id), 
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
 );
+
+CREATE TABLE streaks (
+	user_id UUID NOT NULL, 
+	current_streak INTEGER, 
+	longest_streak INTEGER, 
+	last_workout_date DATE, 
+	updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(), 
+	PRIMARY KEY (user_id), 
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
+);
+
+CREATE TABLE workout_sessions (
+	id UUID NOT NULL, 
+	user_id UUID NOT NULL, 
+	date DATE NOT NULL, 
+	muscle_groups TEXT[] NOT NULL, 
+	raw_user_message TEXT, 
+	agent_notes TEXT, 
+	source TEXT, 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT now(), 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
+);
+
+CREATE TABLE memory_entries (
+	id UUID NOT NULL, 
+	user_id UUID NOT NULL, 
+	at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
+	kind TEXT NOT NULL, 
+	text TEXT NOT NULL, 
+	pinned BOOLEAN DEFAULT false NOT NULL, 
+	superseded_by UUID, 
+	source TEXT DEFAULT 'agent' NOT NULL, 
+	source_turn_id UUID, 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT now(), 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE, 
+	FOREIGN KEY(superseded_by) REFERENCES memory_entries (id) ON DELETE SET NULL, 
+	FOREIGN KEY(source_turn_id) REFERENCES conversation_turns (id) ON DELETE SET NULL
+);
+CREATE INDEX idx_memory_entries_user_at ON memory_entries (user_id, at DESC);
