@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -45,6 +46,15 @@ class Settings(BaseSettings):
     max_unanswered_proactive: int = 3
     quiet_start: int = 22                  # local hour; proactive messages blocked from here...
     quiet_end: int = 8                     # ...until here
+
+    @field_validator("database_url")
+    @classmethod
+    def _use_asyncpg(cls, url: str) -> str:
+        """Hosts (e.g. Railway) hand out postgres:// or postgresql:// URLs; the app needs asyncpg."""
+        for prefix in ("postgres://", "postgresql://"):
+            if url.startswith(prefix):
+                return "postgresql+asyncpg://" + url[len(prefix):]
+        return url
 
 
 settings = Settings()
