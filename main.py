@@ -14,12 +14,9 @@ from fastapi import FastAPI
 
 from config import settings
 from routes.internal import router as internal_router
+from utils.logging_setup import configure_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logging.getLogger("discord").setLevel(logging.WARNING)
+configure_logging()
 log = logging.getLogger(__name__)
 
 

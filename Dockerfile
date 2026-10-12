@@ -4,7 +4,8 @@ FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    LOG_FORMAT=json
 
 # Dependencies first (cached layer), then the app
 COPY pyproject.toml uv.lock ./

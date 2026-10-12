@@ -8,17 +8,16 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from config import settings
 from db.models import Base
+from utils.logging_setup import configure_logging
 
 config = context.config
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+configure_logging()  # stdout (JSON in containers), not alembic.ini's stderr handler
 
 target_metadata = Base.metadata
 
