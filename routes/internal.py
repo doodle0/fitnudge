@@ -41,21 +41,14 @@ class TriggerRequest(BaseModel):
 
 
 @router.post("/scheduler-tick", dependencies=[Depends(_verify_internal_signature)])
-async def scheduler_tick(session: AsyncSession = Depends(get_db)):
+async def scheduler_tick():
     """
-    Called by an external cron every 5 minutes as a fallback to the in-process scheduler.
-    Phase 4 implements should_invoke_for_user; until then this is a no-op.
+    External-cron fallback for the in-process 5-minute tick (same logic; each user's daily
+    window still fires at most once per day).
     """
-    from agent import dispatch
-    from agent.triggers import Trigger
-    from scheduler.triggers import should_invoke_for_user
+    from timing.tick import run_tick
 
-    triggered = []
-    for user in await db.get_active_users(session):
-        if await should_invoke_for_user(user, session):
-            dispatch.submit(str(user.id), Trigger(kind="scheduled", proactive=True, reason="scheduled_check"))
-            triggered.append(str(user.id))
-    return {"triggered_for": triggered}
+    return {"triggered_for": await run_tick()}
 
 
 @router.post("/trigger", dependencies=[Depends(_verify_trigger_signature)])

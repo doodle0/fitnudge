@@ -36,6 +36,8 @@ class User(Base):
     preferred_exercises = Column(ARRAY(Text))
     timezone = Column(Text, default="Asia/Seoul")
     onboarding_complete = Column(Boolean, default=False)
+    rest_weekdays = Column(ARRAY(Integer), nullable=False, server_default=sql_text("'{}'"))  # 0=Mon … 6=Sun
+    proactive_snoozed_until = Column(DateTime(timezone=True))  # no proactive messages before this
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -46,6 +48,7 @@ class User(Base):
     streak = relationship("Streak", back_populates="user", uselist=False, cascade="all, delete-orphan")
     daily_message_counts = relationship("DailyMessageCount", back_populates="user", cascade="all, delete-orphan")
     scheduled_followup = relationship("ScheduledFollowup", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    timing_profile = relationship("TimingProfile", back_populates="user", uselist=False, cascade="all, delete-orphan")
 
 
 class ChannelIdentity(Base):
@@ -145,9 +148,24 @@ class ScheduledFollowup(Base):
     job_id = Column(Text, nullable=False)
     reason = Column(Text)
     scheduled_for = Column(DateTime(timezone=True))
+    kind = Column(Text, nullable=False, server_default="custom")  # pre_reminder | checkin | nudge | custom
+    commitment_at = Column(DateTime(timezone=True))               # the time the user committed to, if any
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="scheduled_followup")
+
+
+class TimingProfile(Base):
+    """When to open each user's daily nudge window. Learned nightly from workout reports."""
+    __tablename__ = "timing_profile"
+
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    learned_minutes = Column(ARRAY(Integer))   # 7 entries (Mon…Sun): nudge minute-of-day, NULL = unknown
+    sample_count = Column(Integer, nullable=False, server_default=sql_text("0"))
+    last_window_fired_on = Column(Date)        # the daily window fires at most once per local day
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User", back_populates="timing_profile")
 
 
 # Async engine and session factory

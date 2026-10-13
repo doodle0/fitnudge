@@ -25,11 +25,17 @@ async def lifespan(app: FastAPI):
     from agent import dispatch
     from agent.runtime import purge_stale_transcripts
     from scheduler.jobs import scheduler
+    from timing.learn import refresh_all
+    from timing.tick import run_tick
 
     scheduler.start()
     purge_stale_transcripts()
     scheduler.add_job(purge_stale_transcripts, "interval", minutes=30,
                       id="purge_agent_transcripts", replace_existing=True)
+    scheduler.add_job(run_tick, "interval", minutes=5, id="daily_window_tick",
+                      replace_existing=True, max_instances=1, coalesce=True)
+    scheduler.add_job(refresh_all, "cron", hour=3, minute=30, id="timing_refresh",
+                      replace_existing=True, coalesce=True)
 
     bot = None
     bot_task: asyncio.Task | None = None

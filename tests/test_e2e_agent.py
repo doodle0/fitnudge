@@ -17,7 +17,8 @@ pytestmark = [pytest.mark.db, pytest.mark.e2e]
 EXPECTED_TOOLS = {
     "mcp__fitnudge__send_message", "mcp__fitnudge__memory_read", "mcp__fitnudge__memory_write",
     "mcp__fitnudge__get_workout_log", "mcp__fitnudge__record_workout",
-    "mcp__fitnudge__schedule_followup", "mcp__fitnudge__cancel_followup",
+    "mcp__fitnudge__schedule_followup", "mcp__fitnudge__cancel_followup", "mcp__fitnudge__commit_plan",
+    "mcp__fitnudge__snooze_proactive", "mcp__fitnudge__update_profile",
 }
 
 

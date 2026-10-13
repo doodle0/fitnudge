@@ -61,7 +61,7 @@ async def session(migrated_db):
     async with AsyncSessionLocal() as s:
         await s.execute(text(
             "TRUNCATE users, channel_identities, workout_sessions, memory_entries, conversation_turns, "
-            "streaks, daily_message_counts, scheduled_followups CASCADE"
+            "streaks, daily_message_counts, scheduled_followups, timing_profile CASCADE"
         ))
         await s.commit()
         yield s

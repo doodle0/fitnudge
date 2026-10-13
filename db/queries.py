@@ -340,7 +340,9 @@ async def increment_daily_count(session: AsyncSession, user_id: str, proactive: 
 
 async def get_scheduled_followup(session: AsyncSession, user_id: str) -> Optional[ScheduledFollowup]:
     result = await session.execute(
-        select(ScheduledFollowup).where(ScheduledFollowup.user_id == uuid.UUID(user_id))
+        select(ScheduledFollowup)
+        .where(ScheduledFollowup.user_id == uuid.UUID(user_id))
+        .execution_options(populate_existing=True)  # rows are written with upserts
     )
     return result.scalar_one_or_none()
 
@@ -351,21 +353,13 @@ async def upsert_scheduled_followup(
     job_id: str,
     reason: str,
     scheduled_for: datetime,
+    kind: str = "custom",
+    commitment_at: datetime | None = None,
 ) -> None:
-    existing = await get_scheduled_followup(session, user_id)
-    if existing:
-        existing.job_id = job_id
-        existing.reason = reason
-        existing.scheduled_for = scheduled_for
-    else:
-        session.add(
-            ScheduledFollowup(
-                user_id=uuid.UUID(user_id),
-                job_id=job_id,
-                reason=reason,
-                scheduled_for=scheduled_for,
-            )
-        )
+    values = dict(job_id=job_id, reason=reason, scheduled_for=scheduled_for, kind=kind, commitment_at=commitment_at)
+    stmt = pg_insert(ScheduledFollowup).values(user_id=uuid.UUID(user_id), **values)
+    stmt = stmt.on_conflict_do_update(index_elements=["user_id"], set_=values)
+    await session.execute(stmt)
     await session.commit()
 
 
@@ -374,3 +368,96 @@ async def delete_scheduled_followup(session: AsyncSession, user_id: str) -> None
         delete(ScheduledFollowup).where(ScheduledFollowup.user_id == uuid.UUID(user_id))
     )
     await session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Proactive loop: timing profile, snooze, profile fields, candidates
+# ---------------------------------------------------------------------------
+
+async def get_timing_profile(session: AsyncSession, user_id: str) -> Optional["TimingProfile"]:
+    from db.models import TimingProfile
+
+    result = await session.execute(
+        select(TimingProfile)
+        .where(TimingProfile.user_id == uuid.UUID(user_id))
+        .execution_options(populate_existing=True)  # rows are written with upserts
+    )
+    return result.scalar_one_or_none()
+
+
+async def upsert_timing_profile(
+    session: AsyncSession, user_id: str, learned_minutes: list[int | None], sample_count: int
+) -> None:
+    from db.models import TimingProfile
+
+    stmt = pg_insert(TimingProfile).values(
+        user_id=uuid.UUID(user_id), learned_minutes=learned_minutes, sample_count=sample_count
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["user_id"],
+        set_={"learned_minutes": learned_minutes, "sample_count": sample_count, "updated_at": func.now()},
+    )
+    await session.execute(stmt)
+    await session.commit()
+
+
+async def mark_window_fired(session: AsyncSession, user_id: str, day: date) -> bool:
+    """Atomically claim today's daily window. Returns False if it was already claimed."""
+    from db.models import TimingProfile
+
+    stmt = pg_insert(TimingProfile).values(user_id=uuid.UUID(user_id), last_window_fired_on=day)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["user_id"],
+        set_={"last_window_fired_on": day},
+        where=(TimingProfile.last_window_fired_on.is_(None)) | (TimingProfile.last_window_fired_on != day),
+    ).returning(TimingProfile.user_id)
+    claimed = (await session.execute(stmt)).first() is not None
+    await session.commit()
+    return claimed
+
+
+async def set_proactive_snooze(session: AsyncSession, user_id: str, until: datetime | None) -> None:
+    await session.execute(
+        update(User).where(User.id == uuid.UUID(user_id)).values(proactive_snoozed_until=until)
+    )
+    await session.commit()
+
+
+async def update_user_fields(session: AsyncSession, user_id: str, **values) -> None:
+    allowed = {"weekly_goal_count", "rest_weekdays", "default_departure_time"}
+    if not values or set(values) - allowed:
+        raise ValueError(f"Only {sorted(allowed)} can be updated.")
+    await session.execute(update(User).where(User.id == uuid.UUID(user_id)).values(**values))
+    await session.commit()
+
+
+async def get_proactive_candidates(session: AsyncSession) -> list[User]:
+    """Users opted in to proactive messages on their active channel."""
+    result = await session.execute(
+        select(User)
+        .join(ChannelIdentity, ChannelIdentity.user_id == User.id)
+        .where(ChannelIdentity.channel == User.active_channel, ChannelIdentity.opted_in_proactive.is_(True))
+    )
+    return list(result.scalars().all())
+
+
+async def get_last_turn_at(session: AsyncSession, user_id: str, role: str) -> Optional[datetime]:
+    result = await session.execute(
+        select(func.max(ConversationTurn.created_at)).where(
+            ConversationTurn.user_id == uuid.UUID(user_id), ConversationTurn.role == role
+        )
+    )
+    return result.scalar_one()
+
+
+async def get_user_report_sessions(session: AsyncSession, user_id: str, days: int = 56) -> list[WorkoutSession]:
+    """Workouts the user reported themselves, for habit learning."""
+    since = today_kst() - timedelta(days=days)
+    result = await session.execute(
+        select(WorkoutSession).where(
+            WorkoutSession.user_id == uuid.UUID(user_id),
+            WorkoutSession.date >= since,
+            WorkoutSession.source == "user_report",
+        )
+    )
+    return list(result.scalars().all())

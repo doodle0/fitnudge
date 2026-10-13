@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agent.triggers import Trigger
 from config import settings
 from memory import store as memory
+from timing.windows import window_for
 from utils.time_utils import KST, now_kst
 
 _WEEKDAYS_KO = "월화수목금토일"
@@ -33,13 +34,14 @@ async def build_context(session: AsyncSession, user_id: str, trigger: Trigger) -
     followup = await db.get_scheduled_followup(session, user_id)
     entries = await memory.window(session, user_id, days=MEMORY_DAYS)
     turns = await db.get_recent_turns(session, user_id, limit=RECENT_TURNS)
+    profile = await db.get_timing_profile(session, user_id)
 
     now = now_kst()
     lines: list[str] = []
 
     lines += ["# Trigger",
               f"kind: {trigger.kind} ({'proactive' if trigger.proactive else 'reactive'})",
-              f"reason: {trigger.reason or '-'}"]
+              f"reason: {trigger.describe()}"]
     if trigger.first_contact:
         lines.append("first_contact: yes — this is the user's first message ever. Greet them, introduce "
                      "yourself in one line, and mention they can run /start to let you message them first.")
@@ -51,9 +53,13 @@ async def build_context(session: AsyncSession, user_id: str, trigger: Trigger) -
               f"name: {user.display_name or '(unknown)'}",
               f"weekly goal: {user.weekly_goal_count or 3} sessions (app default — don't present it as the "
               "user's own goal unless memory says they set it)",
-              f"proactive messages allowed: {'yes' if identity and identity.opted_in_proactive else 'no'}"]
+              f"proactive messages allowed: {'yes' if identity and identity.opted_in_proactive else 'no'}",
+              f"rest days: {', '.join(_WEEKDAYS_KO[d] for d in (user.rest_weekdays or [])) or 'none set'}",
+              f"usual workout time: {user.default_departure_time.strftime('%H:%M') if user.default_departure_time else 'not set'}"]
+    if user.proactive_snoozed_until and user.proactive_snoozed_until > now:
+        lines.append(f"proactive snoozed until: {user.proactive_snoozed_until.astimezone(KST):%m-%d %H:%M}")
 
-    followup_text = (f"{followup.scheduled_for.astimezone(KST):%m-%d %H:%M} — {followup.reason}"
+    followup_text = (f"{followup.scheduled_for.astimezone(KST):%m-%d %H:%M} — {followup.kind}: {followup.reason}"
                      if followup and followup.scheduled_for else "none")
     lines += ["", "# Today",
               f"worked out today: {'yes (' + ', '.join(today_workout.muscle_groups) + ')' if today_workout else 'no'}",
@@ -61,6 +67,8 @@ async def build_context(session: AsyncSession, user_id: str, trigger: Trigger) -
               f"unanswered proactive messages: {unanswered}/{settings.max_unanswered_proactive}",
               f"replies sent: {reply_count}",
               f"pending follow-up: {followup_text}",
+              f"daily nudge window: {window_for(now.date(), user, profile).describe()}"
+              f"{' — already used today' if profile and profile.last_window_fired_on == now.date() else ''}",
               f"quiet hours (no proactive messages): {settings.quiet_start:02d}:00–{settings.quiet_end:02d}:00"]
 
     lines += ["", "# Streak & week",
@@ -88,6 +96,11 @@ async def build_context(session: AsyncSession, user_id: str, trigger: Trigger) -
 
     lines += ["", "# Your task"]
     if trigger.proactive:
+        step = unanswered + 1
+        ladder = {1: "first nudge — a specific suggestion plus an easy out",
+                  2: "no reply yet — a different angle or a smaller ask (\"10분만\")",
+                  3: "last one — a warm release (\"오늘은 쉬어도 돼요, 내일 봐요\"); schedule nothing after it"}
+        lines.append(f"Proactive ladder step {min(step, 3)} of 3: {ladder.get(step, ladder[3])}.")
         lines.append("Decide whether a proactive message is genuinely helpful right now. If yes, send one "
                      "with send_message (and schedule a follow-up if warranted). If not, end without sending.")
     else:

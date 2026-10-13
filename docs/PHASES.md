@@ -185,23 +185,53 @@ Offline = `TEST_DATABASE_URL=… uv run pytest` (real SDK CLI against a scripted
 
 ---
 
-## Phase 4 — Proactive Loop 🔲
+## Phase 4 — Proactive Loop ✅
 **Goal**: The agent reaches out at good times and follows through on commitments.
+**Status**: complete (2026-10-14), verified offline and with live Claude (console channel). Not yet deployed. The production quiet-hours override (`QUIET_START=0`/`QUIET_END=0`) should be removed first, because Phase 4 is the first phase that messages users on a schedule.
 
-### Planned Deliverables
+### Files Created / Modified
 
-- `timing/`: send-window computation, nightly habit learning, calendar/rest-day suppression
-- Cron tick (every 5 min) calls `timing.is_window_open`; one-shot follow-up jobs
-- Escalation ladder (initial → new angle → reduced ask → soft release → silence)
-- Commitment tracking: pre-reminder and post-time check-in
+| File | Change |
+|---|---|
+| `timing/windows.py` | Daily nudge window (learned → usual time → default 18:30 weekdays / 11:00 weekends, 60 min long) and `check_window()` (all suppression rules + proactive guards) |
+| `timing/learn.py` | Habit learning from workout report times: median report time − 2 h per weekday, weekday/weekend fallback, clamped to 08:00–21:00 |
+| `timing/tick.py` | 5-minute tick: opens each opted-in user's window at most once per day (atomic claim) |
+| `scheduler/jobs.py` | Follow-up kinds (`pre_reminder`, `checkin`, `nudge`, `custom`), `schedule_commitment()`, check-in chained after a pre-reminder fires |
+| `agent/tools.py` | New: `commit_plan`, `snooze_proactive`, `update_profile`. `record_workout` cancels follow-ups; `schedule_followup` refuses after the ladder's release step |
+| `agent/triggers.py`, `agent/context.py`, `agent/prompts/system.py` | Trigger descriptions per follow-up kind; context shows rest days, usual time, snooze, today's window, ladder step |
+| `utils/message_guard.py` | Snooze blocks all proactive messages |
+| `db/migrations/versions/0003_proactive_loop.py` | `users.rest_weekdays`, `users.proactive_snoozed_until`, follow-up `kind`/`commitment_at`, `timing_profile` |
+| `main.py`, `routes/internal.py` | Jobs: tick every 5 min, timing refresh 03:30 KST; `/internal/scheduler-tick` runs the same tick |
+| Removed | `scheduler/triggers.py` (stub) |
+| `tests/` | +17 tests (67 total): windows, learning, tick, commitments, chain, snooze, ladder, profile |
+
+### Key Design Decisions
+
+- **Code decides when, the agent decides whether.** `check_window()` applies every rule before a model call, so a blocked user costs nothing.
+- **Structured suppression instead of parsing memory text.** The agent calls `snooze_proactive` ("회식", "아파", "출장") and `update_profile` (rest days, usual time, weekly goal). Code then enforces them.
+- **Commitments are chained in code.** `commit_plan` schedules the pre-reminder (T−30). When it fires, code schedules the check-in (T+15) unless a workout was recorded, another follow-up exists, or the user snoozed. There is still one pending follow-up per user.
+- **The daily window is skipped** if the user already got a proactive message today, has a pending follow-up, or is mid-conversation (a user message in the last 90 min).
+
+### Deviations from Original Plan
+
+- The escalation ladder has **3 steps** (nudge → different angle/smaller ask → warm release), matching `MAX_UNANSWERED_PROACTIVE=3`. The 4-step list in CLAUDE.md §6.2 merged steps 2 and 3.
+- Habit learning uses workout report times only. Reply latency isn't used yet.
+- `users.default_departure_time` is reused as the "usual workout time" (no new column).
+- A snooze ends at `QUIET_END` on the day after its last day. With the quiet-hours override (0/0) that's midnight.
+
+### Live Run (2026-10-13, Claude Opus 5.5, console channel)
+
+"오늘 저녁 9시에 하체 하러 갈게!" → `commit_plan`, pre-reminder 20:30. "회식 잡혔어 ㅠ" → warm reply + `snooze_proactive`, follow-up cancelled. "주말엔 안 해, 주 4회" → `update_profile` (rest 토·일, goal 4). Daily window for a user with 가슴·삼두 (Sat) and 하체 (Sun) → "오늘은 등이나 어깨" + asked for a time + easy out, no-reply nudge scheduled +71 min. Total **$0.105**.
 
 ### Verification Checklist
 
-- [ ] No proactive message inside quiet hours (test with a frozen clock)
-- [ ] A commitment "21시에 갈게" produces a ~20:30 reminder and a ~21:15 check-in if no update
-- [ ] 3 unanswered proactive messages → no further proactive messages that day
-- [ ] A recorded workout or stated skip cancels pending follow-ups
-- [ ] A stated 회식 (from memory) suppresses that evening's nudge
+- [x] No proactive message inside quiet hours (test with a frozen clock) — *`test_window_closed_in_quiet_hours`, guard tests*
+- [x] A commitment "21시에 갈게" produces a ~20:30 reminder and a ~21:15 check-in if no update — *tests for both + chain; live: pre-reminder at 20:30*
+- [x] 3 unanswered proactive messages → no further proactive messages that day — *guard + `schedule_followup` ladder stop*
+- [x] A recorded workout or stated skip cancels pending follow-ups — *tests; live: 회식 cancelled the 20:30 reminder*
+- [x] A stated 회식 (from memory) suppresses that evening's nudge — *via `snooze_proactive`; the window check reports "snoozed"*
+
+After deploying: confirm the `daily_window_tick` and `timing_refresh` jobs appear in the startup log, and that a daily nudge arrives on Discord inside the window.
 
 ---
 

@@ -12,7 +12,7 @@ from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
-from utils.time_utils import is_quiet_hour, now_kst
+from utils.time_utils import KST, is_quiet_hour, now_kst
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,8 @@ async def check_send(
     user = await db.get_user(session, user_id)
     if user is None:
         return _deny("unknown user.")
+    if user.proactive_snoozed_until is not None and now < user.proactive_snoozed_until:
+        return _deny(f"proactive messages are snoozed until {user.proactive_snoozed_until.astimezone(KST):%m-%d %H:%M}.")
     identity = await db.get_identity_for_user(session, user_id, user.active_channel)
     if identity is None or not identity.opted_in_proactive:
         return _deny("the user has not opted in to proactive messages (or paused them).")

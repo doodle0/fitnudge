@@ -18,6 +18,8 @@ CREATE TABLE users (
 	preferred_exercises TEXT[], 
 	timezone TEXT, 
 	onboarding_complete BOOLEAN, 
+	rest_weekdays INTEGER[] DEFAULT '{}' NOT NULL, 
+	proactive_snoozed_until TIMESTAMP WITH TIME ZONE, 
 	created_at TIMESTAMP WITH TIME ZONE DEFAULT now(), 
 	updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(), 
 	PRIMARY KEY (id), 
@@ -62,6 +64,8 @@ CREATE TABLE scheduled_followups (
 	job_id TEXT NOT NULL, 
 	reason TEXT, 
 	scheduled_for TIMESTAMP WITH TIME ZONE, 
+	kind TEXT DEFAULT 'custom' NOT NULL, 
+	commitment_at TIMESTAMP WITH TIME ZONE, 
 	created_at TIMESTAMP WITH TIME ZONE DEFAULT now(), 
 	PRIMARY KEY (user_id), 
 	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
@@ -72,6 +76,16 @@ CREATE TABLE streaks (
 	current_streak INTEGER, 
 	longest_streak INTEGER, 
 	last_workout_date DATE, 
+	updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(), 
+	PRIMARY KEY (user_id), 
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
+);
+
+CREATE TABLE timing_profile (
+	user_id UUID NOT NULL, 
+	learned_minutes INTEGER[], 
+	sample_count INTEGER DEFAULT 0 NOT NULL, 
+	last_window_fired_on DATE, 
 	updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(), 
 	PRIMARY KEY (user_id), 
 	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE

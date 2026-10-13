@@ -110,6 +110,7 @@ async def _set_proactive(interaction: discord.Interaction, opted_in: bool) -> No
         await db.set_opted_in_proactive(session, str(user.id), CHANNEL, opted_in)
         if opted_in:
             await db.mark_onboarding_complete(session, str(user.id))
+            await db.set_proactive_snooze(session, str(user.id), None)  # /start and /resume end any snooze
 
 
 def _register_commands(bot: FitNudgeBot) -> None:

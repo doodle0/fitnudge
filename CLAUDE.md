@@ -138,8 +138,10 @@ Rules:
 | `get_calendar_events(date)` | *(future, with Kakao or another calendar)* overtime/dinner suppression. Not registered in the Discord drill |
 | `get_location_status()` | *(future)* `at_work` / `left_work` / `near_gym` / `unknown`. Not registered in the Discord drill |
 | `send_message(text)` | Send through the active channel. Guarded |
-| `schedule_followup(at, reason)` / `cancel_followup()` | One pending follow-up per user |
-| `update_profile(field, value)` | Whitelisted fields only: weekly goal, persona variables, rest days |
+| `commit_plan(at, plan)` | The user committed to a time: pre-reminder (T−30), then a code-chained check-in (T+15) |
+| `schedule_followup(at \| in_minutes, reason)` / `cancel_followup()` | One pending follow-up per user; refused after the ladder's release step |
+| `snooze_proactive(days, reason)` | No proactive messages until a date (회식, sick, trip); cancels follow-ups |
+| `update_profile(field, value)` | Whitelisted fields only: weekly goal, rest days, usual workout time (persona variables in Phase 6) |
 
 The tools return plain text that the model can read easily. Errors come back as tool errors rather than exceptions.
 
@@ -205,9 +207,10 @@ These are real, named behavioral-science mechanisms, used to help the user do so
 ### 6.2 Escalation ladder (proactive, per day)
 
 1. Initial nudge: a specific suggestion plus an easy out
-2. No reply after ~30–45 min: a different angle (progress or streak)
-3. Still no reply: the reduced ask
-4. Soft release ("오늘은 쉬어도 돼요, 내일 봐요"), then **silence for the rest of the day**
+2. No reply after ~45–90 min: a different angle (progress or streak) or the reduced ask ("10분만")
+3. Soft release ("오늘은 쉬어도 돼요, 내일 봐요"), then **silence for the rest of the day**
+
+Three steps match `MAX_UNANSWERED_PROACTIVE=3`. The context tells the agent which step it's on, and `schedule_followup` refuses after the release.
 
 Any reply resets the ladder. A stated skip or rest ends it immediately with zero-judgment acknowledgment.
 
@@ -222,7 +225,7 @@ Signals, in priority order:
 4. Declared rest days and stated obstacles from memory (회식, 야근, 출장)
 5. *(future, Kakao expansion)* geofence exit from the workplace and calendar suppression
 
-The cron tick (every 5 min) only asks `timing.is_window_open(user)`. Follow-ups are one-shot APScheduler jobs stored in `SQLAlchemyJobStore`.
+The tick (every 5 min, `timing/tick.py`) asks `timing.windows.check_window(user, now)` and fires each user's window at most once per day. The window starts at the learned time, else the usual time, else 18:30 on weekdays / 11:00 on weekends, and lasts 60 min. Obstacles and rest days are structured (`snooze_proactive`, `update_profile`), not parsed from memory text. Follow-ups are one-shot APScheduler jobs in `SQLAlchemyJobStore`. A commitment's check-in is chained in code after its pre-reminder fires.
 
 ---
 
@@ -463,7 +466,7 @@ Details and checklists: [`docs/PHASES.md`](docs/PHASES.md).
 | 1 | ✅ | Kakao OAuth, send-to-me, webhook receiver, DB schema |
 | 2 | ✅ | LangChain agent prototype with tools + manual trigger (to be replaced) |
 | 3 | ✅ | **Foundation reset on Discord:** Agent SDK migration, channel abstraction + Discord adapter, platform-neutral users, memory store, guard split, Alembic. Ends with a working reactive DM conversation |
-| 4 | 🔲 | **Proactive loop (end-to-end drill):** timing windows, follow-ups, escalation ladder, commitment tracking — all over Discord DMs |
+| 4 | ✅ | **Proactive loop (end-to-end drill):** timing windows, follow-ups, escalation ladder, commitment tracking — all over Discord DMs |
 | 5 | 🔲 | **Expertise:** training engine, knowledge base, Q&A, injury handling |
 | 6 | 🔲 | **Personas** + personality variables, onboarding flow (`/start`) |
 | 7 | 🔲 | **Beta (Discord):** eval suite, weekly recap, privacy commands, hardening, prompt tuning |

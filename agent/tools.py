@@ -10,14 +10,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, time, timedelta
 from typing import Any
 
 from claude_agent_sdk import SdkMcpTool, tool
 
 from agent.triggers import Trigger
 from config import settings
-from utils.time_utils import KST, now_kst
+from utils.time_utils import KST, now_kst, parse_local_time_today
 
 log = logging.getLogger(__name__)
 
@@ -175,16 +175,19 @@ def build_tools(state: RunState) -> list[SdkMcpTool]:
             user = await db.get_user(session, user_id)
             # No memory entry here: workout_sessions is the record, and the extractor already
             # captured the user's own description of the workout.
+            await scheduler_jobs.cancel_user_followup(user_id, session)  # nothing left to remind about
         return _ok(
             f"Recorded {day}: {', '.join(groups)}. Current streak: {streak.current_streak} days "
-            f"(longest {streak.longest_streak}). This week: {week}/{user.weekly_goal_count or 3}."
+            f"(longest {streak.longest_streak}). This week: {week}/{user.weekly_goal_count or 3}. "
+            "Any pending follow-up was cancelled."
         )
 
     @tool(
         "schedule_followup",
-        "Wake yourself up later for this user (replaces any pending follow-up). Give either "
-        "`at` (HH:MM, KST; the next occurrence) or `in_minutes`. Proactive messages can't be sent "
-        f"during quiet hours ({settings.quiet_start:02d}:00–{settings.quiet_end:02d}:00).",
+        "Wake yourself up later for this user (replaces any pending follow-up), e.g. a no-reply "
+        "nudge. For a time the user committed to, use commit_plan instead. Give either `at` "
+        "(HH:MM, KST; the next occurrence) or `in_minutes`. Proactive messages can't be sent during "
+        f"quiet hours ({settings.quiet_start:02d}:00–{settings.quiet_end:02d}:00).",
         _schema(
             {
                 "at": {"type": "string", "pattern": "^[0-2]?[0-9]:[0-5][0-9]$"},
@@ -200,8 +203,87 @@ def build_tools(state: RunState) -> list[SdkMcpTool]:
         except ValueError as exc:
             return _err(str(exc))
         async with AsyncSessionLocal() as session:
-            await scheduler_jobs.schedule_user_followup(user_id, run_at, args["reason"], session)
+            if state.trigger.proactive:
+                unanswered = await db.count_unanswered_proactive_today(session, user_id)
+                if unanswered >= settings.max_unanswered_proactive:
+                    return _err("Today's nudges are finished (the release message was sent). "
+                                "Don't schedule more; wait for the user.")
+            kind = "nudge" if state.trigger.proactive else "custom"
+            await scheduler_jobs.schedule_user_followup(user_id, run_at, args["reason"], session, kind=kind)
         return _ok(f"Follow-up scheduled for {run_at.astimezone(KST):%m-%d %H:%M} KST: {args['reason']}")
+
+    @tool(
+        "commit_plan",
+        "The user committed to working out at a time (\"21시에 갈게\"). Schedules a reminder ~30 min "
+        "before and, automatically, a check-in ~15 min after if no workout is recorded. Replaces any "
+        "pending follow-up.",
+        _schema(
+            {
+                "at": {"type": "string", "pattern": "^[0-2]?[0-9]:[0-5][0-9]$",
+                       "description": "Planned start, HH:MM KST (the next occurrence)."},
+                "plan": {"type": "string", "description": "Short Korean description, e.g. '등 운동'."},
+            },
+            ["at", "plan"],
+        ),
+    )
+    async def commit_plan(args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            commitment_at = parse_local_time_today(args["at"])
+        except ValueError:
+            return _err(f"Invalid time '{args.get('at')}'. Use HH:MM (24h, KST).")
+        plan = " ".join((args.get("plan") or "운동").split())[:100]
+        async with AsyncSessionLocal() as session:
+            summary = await scheduler_jobs.schedule_commitment(user_id, commitment_at, plan, session)
+        return _ok(f"Plan noted: {plan} at {commitment_at:%H:%M}. {summary}")
+
+    @tool(
+        "snooze_proactive",
+        "Stop proactive messages for a while (the user is busy, sick, travelling, or said not today). "
+        "Cancels any pending follow-up. days: 0 = rest of today, N = through N more days, "
+        "-1 = end an existing snooze. Replies to the user are never affected.",
+        _schema(
+            {
+                "days": {"type": "integer", "minimum": -1, "maximum": 14},
+                "reason": {"type": "string"},
+            },
+            ["days", "reason"],
+        ),
+    )
+    async def snooze_proactive(args: dict[str, Any]) -> dict[str, Any]:
+        days = int(args["days"])
+        async with AsyncSessionLocal() as session:
+            if days < 0:
+                await db.set_proactive_snooze(session, user_id, None)
+                return _ok("Snooze ended; proactive messages are allowed again.")
+            until = datetime.combine(now_kst().date() + timedelta(days=days + 1),
+                                     time(settings.quiet_end), tzinfo=KST)
+            await db.set_proactive_snooze(session, user_id, until)
+            await scheduler_jobs.cancel_user_followup(user_id, session)
+        log.info("Proactive snoozed | user=%s | until=%s", user_id, until.isoformat())
+        return _ok(f"No proactive messages until {until:%m-%d %H:%M} KST ({args['reason']}).")
+
+    @tool(
+        "update_profile",
+        "Update a profile setting the user stated. weekly_goal: sessions per week (1–14). "
+        "rest_days: days they never train, e.g. '토,일' or 'none'. usual_time: when they're usually "
+        "free to work out, HH:MM or 'none' (used to time the daily nudge).",
+        _schema(
+            {
+                "field": {"type": "string", "enum": ["weekly_goal", "rest_days", "usual_time"]},
+                "value": {"type": "string"},
+            },
+            ["field", "value"],
+        ),
+    )
+    async def update_profile(args: dict[str, Any]) -> dict[str, Any]:
+        field_name, value = args["field"], str(args.get("value", "")).strip()
+        try:
+            column, parsed, shown = _parse_profile_value(field_name, value)
+        except ValueError as exc:
+            return _err(str(exc))
+        async with AsyncSessionLocal() as session:
+            await db.update_user_fields(session, user_id, **{column: parsed})
+        return _ok(f"Updated {field_name} → {shown}.")
 
     @tool("cancel_followup", "Cancel the pending follow-up, if any.", _schema({}, []))
     async def cancel_followup(args: dict[str, Any]) -> dict[str, Any]:
@@ -210,4 +292,32 @@ def build_tools(state: RunState) -> list[SdkMcpTool]:
         return _ok("Follow-up cancelled.")
 
     return [send_message, memory_read, memory_write, get_workout_log, record_workout,
-            schedule_followup, cancel_followup]
+            commit_plan, schedule_followup, cancel_followup, snooze_proactive, update_profile]
+
+
+_WEEKDAY_NAMES = {"월": 0, "화": 1, "수": 2, "목": 3, "금": 4, "토": 5, "일": 6}
+
+
+def _parse_profile_value(field_name: str, value: str) -> tuple[str, Any, str]:
+    """Validate an update_profile value. Returns (column, parsed value, display text)."""
+    none = value.lower() in {"none", "없음", ""}
+    if field_name == "weekly_goal":
+        if not value.isdigit() or not 1 <= int(value) <= 14:
+            raise ValueError("weekly_goal must be a number from 1 to 14.")
+        return "weekly_goal_count", int(value), value
+    if field_name == "rest_days":
+        if none:
+            return "rest_weekdays", [], "none"
+        days = sorted({_WEEKDAY_NAMES[c] for c in value if c in _WEEKDAY_NAMES})
+        if not days:
+            raise ValueError("rest_days must name weekdays in Korean (월 화 수 목 금 토 일) or be 'none'.")
+        return "rest_weekdays", days, ",".join("월화수목금토일"[d] for d in days)
+    if field_name == "usual_time":
+        if none:
+            return "default_departure_time", None, "none"
+        try:
+            hour, minute = (int(x) for x in value.split(":"))
+            return "default_departure_time", time(hour, minute), f"{hour:02d}:{minute:02d}"
+        except ValueError:
+            raise ValueError("usual_time must be HH:MM (24h) or 'none'.") from None
+    raise ValueError(f"Unknown field '{field_name}'.")
